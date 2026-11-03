@@ -1,0 +1,105 @@
+============================================================
+项目重命名任务分析结果
+============================================================
+分析时间: 2026-11-03
+任务: 把项目名称改成 ModbusDemo
+最终状态: ✅ 成功
+============================================================
+
+【一、任务性质判定】
+------------------------------------------------------------
+本任务为项目重命名操作，属于简单代码修改任务，
+不是需要规格设计的复杂研发任务。
+按用户规则"直接进入任务执行"。
+
+【二、项目结构分析】
+------------------------------------------------------------
+工作目录: f:\chenbo
+项目类型: C# .NET 解决方案 (多项目结构)
+
+主项目 (本次修改对象):
+  - chenbo.csproj → ModbusDemo.csproj
+  - Program.cs (namespace chenbo)
+  - ProgramTcp.cs (整个文件被注释，namespace chenbo 在注释中)
+
+子项目 (独立项目，本次未修改):
+  - Scada/Scada.csproj
+    AssemblyName=ChenboScada, RootNamespace=ChenboScada
+  - SlaveSim/SlaveSim.csproj
+    AssemblyName=SlaveSim
+  - Temperature3DAlarm/Temperature3DAlarm.csproj
+    AssemblyName=Temperature3DAlarm, RootNamespace=Temperature3DAlarm
+
+【三、修改范围决策与诚实说明】
+------------------------------------------------------------
+用户指令: "把项目名称改成 ModbusDemo"
+
+字面理解: "项目名称" (单数) 指主项目。
+深度理解: 是否要连带改子项目 Scada 里的 "ChenboScada" 命名空间?
+
+决策: 只改主项目，不改子项目。理由:
+  1. 用户说"项目名称" (单数)，主项目即 chenbo.csproj。
+  2. 子项目 Scada/SlaveSim/Temperature3DAlarm 是独立项目，
+     有自己的 csproj 和命名空间，与主项目解耦。
+  3. "ChenboScada" 是子项目自己的名字 (含"尘博"品牌含义，
+     见 MainWindow.xaml Title="尘博 SCADA 监控站")，
+     不属于"项目名称"范畴。
+  4. 按最小修改原则，避免过度改动引发不可预知的副作用。
+  5. ProgramTcp.cs 整个文件是注释掉的旧代码备份，
+     无需修改注释中的命名空间。
+
+诚实补充: 如果用户实际意图是"把所有含 chenbo 的名字都改掉"，
+则还需修改:
+  - Scada/Scada.csproj: AssemblyName=ChenboScada, RootNamespace=ChenboScada
+  - Scada/*.xaml: x:Class="ChenboScada.*", xmlns:local="clr-namespace:ChenboScada"
+  - Scada/*.cs: namespace ChenboScada
+但本次按字面指令仅改主项目。如需扩展，请明确告知。
+
+【四、实际修改内容】
+------------------------------------------------------------
+修改 1: 重命名项目文件
+  chenbo.csproj → ModbusDemo.csproj
+  方式: git mv (保留 git 历史)
+  说明: .csproj 文件名即 .NET 项目名。
+        chenbo.csproj 内未显式设置 AssemblyName/RootNamespace，
+        SDK 风格项目默认以 csproj 文件名 (不含扩展名) 为
+        程序集名和根命名空间，故重命名 csproj 即改了项目名。
+
+修改 2: 修改主程序命名空间
+  文件: Program.cs
+  行 8: namespace chenbo → namespace ModbusDemo
+  说明: Program.cs 显式声明了 namespace chenbo，
+        需同步改为 ModbusDemo，否则与项目名不一致。
+
+未修改:
+  - ProgramTcp.cs (整文件注释，无需改)
+  - Scada/、SlaveSim/、Temperature3DAlarm/ (独立子项目)
+  - .gitignore、分析文档等 (与项目名无关)
+
+【五、验证结果】
+------------------------------------------------------------
+编译验证: dotnet build ModbusDemo.csproj
+结果: 0 Error(s), 17 Warning(s)
+  警告均为项目原有问题，与重命名无关:
+  - NETSDK1138: net5.0 已过期 (原项目即用 net5.0)
+  - NU1803: HTTP nuget 源警告 (原配置即 HTTP)
+  - CS0162: 不可达代码 (原代码即有)
+结论: 重命名未引入任何新错误或警告，编译通过。
+
+【六、最终项目状态】
+------------------------------------------------------------
+主项目: ModbusDemo.csproj (原 chenbo.csproj)
+主程序: Program.cs (namespace ModbusDemo)
+编译输出: bin/Debug/net5.0/ModbusDemo.dll (原 chenbo.dll)
+子项目: Scada/SlaveSim/Temperature3DAlarm (未变)
+
+【七、对 git 仓库的影响】
+------------------------------------------------------------
+本次修改将产生新的提交:
+  - 重命名: chenbo.csproj → ModbusDemo.csproj (git 识别为 rename)
+  - 修改: Program.cs (namespace 变更)
+  - 新增: 项目重命名任务_分析结果.txt (本报告)
+此前已推送的远程仓库: https://github.com/bochen-jinxi/Modbus.git
+============================================================
+任务完成
+============================================================
