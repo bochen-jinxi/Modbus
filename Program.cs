@@ -608,6 +608,15 @@ namespace ModbusDemo
                         }
                         else
                         {
+                            // ★ 超时后不立即放弃：回显可能正在途中（拆包，前半截已在 buf）。
+                            //   等一个帧间隔（3.65ms@9600）让后半截到齐，再切帧看能否凑成完整 0x05 回显。
+                            //   若凑齐且整帧匹配 → 当作迟到成功，避免清掉半截帧导致无谓重试。
+                            //   若仍不齐 → 才是真的超时，进入下一轮重试（下一轮开头会清缓冲）。
+                            if (TryConsumeLateAck(wr))
+                            {
+                                Console.WriteLine($"[迟到回显·从站{slave:X2}] 第{attempt}次 超时后凑齐回显，按成功处理");
+                                return true;
+                            }
                             Console.WriteLine($"[写超时·从站{slave:X2}] 第{attempt}次 {TimeoutMs}ms 没回显，继续重试");
                         }
                     }
@@ -620,6 +629,46 @@ namespace ModbusDemo
             {
                 activeWrite = null;        // ★ 写完清活跃引用，防止迟到回显拿旧 wr 比对
             }
+        }
+
+        // ★ 超时后尝试消费"迟到但已凑齐"的 0x05 回显。
+        //   场景: Ack.WaitOne 超时，但回显正在途中（拆包，前半截已在 buf）。
+        //         若立即进入下一轮清缓冲，会清掉前半截，后半截变残帧。
+        //   做法: 等一个帧间隔让后半截到齐 → 切帧 → 若有完整 0x05 且整帧匹配 wr.Frame → 消费它，返回 true。
+        //   注意: 只在超时后调用，且只消费"与当前 wr 整帧匹配"的回显，不会误吞别的请求的应答。
+        static bool TryConsumeLateAck(WriteRequest wr)
+        {
+            // 等一个帧间隔（3.65ms@9600），让可能正在途中的后半截到齐。
+            // 用 PreciseSleepMs 而非 Thread.Sleep，保证 3.65ms 级精度（Thread.Sleep 最小 ~15.6ms）。
+            PreciseSleepMs(FrameGapMs);
+
+            // 切帧：把 buf 里已凑齐的完整帧取出来
+            List<byte[]> frames;
+            lock (gate) { frames = DrainInLock(); }
+
+            foreach (var f in frames)
+            {
+                // 只认 0x05 回显，且整帧与当前请求的发送帧完全一致
+                if (f.Length >= 2 && f[1] == 0x05 && f.Length == wr.Frame.Length)
+                {
+                    bool match = true;
+                    for (int i = 0; i < f.Length; i++)
+                    {
+                        if (f[i] != wr.Frame[i]) { match = false; break; }
+                    }
+                    if (match)
+                    {
+                        // CRC 已在 DrainInLock 校验过，整帧又匹配，确认是本请求的迟到回显
+                        ushort addr = (ushort)((f[2] << 8) | f[3]);
+                        bool on = (f[4] == 0xFF && f[5] == 0x00);
+                        Console.WriteLine($"[写线圈成功·从站{f[0]:X2}] 线圈{addr} = {(on ? "ON(开到位)" : "OFF(关到位)")}（迟到回显）");
+                        return true;
+                    }
+                }
+                // 非 0x05 或不匹配的帧：交回 Handle 处理（可能是读应答等，不吞掉）
+                Handle(f);
+            }
+            return false;
         }
 
         // 开到位：写线圈 ON

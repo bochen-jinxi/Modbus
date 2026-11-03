@@ -1,0 +1,199 @@
+============================================================
+WriteRequest.Ack 属性设计意图分析
+============================================================
+分析时间: 2026-11-03
+问题: WriteRequest 有 Ack 属性，是因为它自己在发送请求后，
+      自己还要等到应答结果？
+============================================================
+
+【一、直接回答】
+------------------------------------------------------------
+是的，你的理解基本正确，但需要精确化:
+
+Ack 的存在是因为 WriteRequest 的"发送线程"(WriteLoop/
+ExecuteWrite) 在发出写帧后，必须等待从站的 0x05 回显
+应答，才能判断这次写操作是否成功。
+
+但"等应答"的不是 WriteRequest 对象自己(对象不会自己执行
+代码)，而是执行写操作的线程 (WriteLoop 线程) 在
+ExecuteWrite 里阻塞等这个 Ack。
+
+Ack 是"发送方(写线程)"与"接收方(接收线程/Handle)"之间
+的同步信号:
+  - 写线程: 发完帧后 wr.Ack.WaitOne(TimeoutMs) 阻塞等
+  - 接收线程: Handle 收到 0x05 回显后 wr.Ack.Set() 唤醒
+
+所以 Ack 的本质是: 跨线程的"请求-应答"握手信号。
+
+【二、为什么需要 Ack? 不能直接等 Completed 吗?】
+------------------------------------------------------------
+WriteRequest 有两个信号，层次不同:
+
+  Ack (AutoResetEvent)
+    层次: 单次发送的应答信号 (一次交互级别)
+    Set 时机: Handle 收到这次发送的 0x05 回显
+    Wait 方: ExecuteWrite (重试循环的每一轮)
+    用途: 判断"这一帧发出后，从站有没有正确回显"
+
+  Completed (ManualResetEventSlim)
+    层次: 整个写请求的最终结果 (含重试全部结束)
+    Set 时机: WriteLoop 执行完 ExecuteWrite (成功或重试耗尽)
+    Wait 方: WriteSingleCoil / 调用方
+    用途: 判断"这个写请求最终成功还是失败"
+
+为什么不能合并成一个?
+
+因为 ExecuteWrite 有重试循环 (最多 WriteRetry=3 次):
+  for (attempt = 1..3):
+      发帧 → 等Ack → 若AckOk返回true / 否则重试
+
+每一轮重试都需要单独等一次应答 (Ack)，而 Completed 只在
+全部重试结束后才 Set 一次。如果只有 Completed，ExecuteWrite
+就无法在"单轮"粒度上知道"这帧有没有回显"，也就无法决定
+要不要重试。
+
+换句话说:
+  Ack     = "这一帧的应答到了吗"  (每轮重试都用一次)
+  Completed = "整个请求执行完了吗" (调用方用一次)
+
+【三、Ack 的工作流程 (时序)】
+------------------------------------------------------------
+以用户输入 "on 1 0" (从站01线圈0开到位) 为例:
+
+时刻 T0: CmdLoop 解析命令
+  → WriteSingleCoil 构造 WriteRequest wr
+  → writeQueue.Enqueue(wr)        // 投递队列
+  → wr.Completed.Wait(...)        // 调用方阻塞等最终结果
+
+时刻 T1: WriteLoop 取出 wr
+  → lock(busLock) 独占总线
+  → ExecuteWrite(wr):
+      for attempt = 1..3:
+        wr.Ack.Reset()            // 清上轮残留信号
+        activeWrite = wr          // 告诉Handle回显归这个wr
+        sp.Write(frame)           // 发帧到串口
+        wr.Ack.WaitOne(50ms)      // ★ 这里等Ack
+
+时刻 T2: 从站回显 8 字节，串口触发 OnData
+  → OnData → DrainInLock 切帧 → Handle(frame)
+  → Handle 识别 func==0x05
+  → 比对 frame == activeWrite.Frame (整帧比对防错配)
+  → aw.AckOk = true               // 标记这次回显成功
+  → aw.Ack.Set()                  // ★ 唤醒 ExecuteWrite
+
+时刻 T3: ExecuteWrite 的 Ack.WaitOne 返回 true
+  → if (wr.AckOk) return true     // 成功，退出重试循环
+  → WriteLoop: wr.Completed.Set() // 通知调用方
+
+时刻 T4: WriteSingleCoil 的 Completed.Wait 返回
+  → return wr.Result              // 拿到最终结果
+
+【四、Ack 用 AutoResetEvent 而非 ManualResetEvent 的原因】
+------------------------------------------------------------
+AutoResetEvent 的特性: Set 后自动 Reset (一次 Set 唤醒一次 Wait)。
+
+这正好匹配重试场景:
+  - 第1轮: Reset → Wait → (超时或被Set) → 进第2轮
+  - 第2轮: Reset → Wait → ...
+  每轮 Wait 前都显式 Reset，即使上一轮的迟到 Set 残留
+  也不会误唤醒下一轮 (虽然代码里每轮都 Reset，其实
+  AutoReset 的自动 Reset 已是双保险)。
+
+对比: frameReceived (读操作的应答信号) 也是 AutoResetEvent，
+      同理——一次 Set 唤醒一次 Wait，天然防溢出。
+
+而 Completed 用 ManualResetEventSlim:
+  - 它只 Set 一次 (请求完成后)，不需要自动 Reset
+  - 多个等待者 (调用方 + 可能的监控线程) 都能被唤醒
+  - Slim 版本对短时等待有更好性能
+
+【五、为什么 Ack 在 WriteRequest 里，而不是 static?】
+------------------------------------------------------------
+关键设计: 每个写请求自带独立 Ack。
+
+对比: frameReceived 是 static 的，因为读操作 (SendLoop)
+      串行轮询，同一时刻只有一个读请求在等应答，全局一个
+      信号够用。
+
+但写操作支持"多按钮同时操作":
+  - 多个 WriteRequest 并发投递到 writeQueue
+  - 虽然执行是串行的 (WriteLoop 一次取一个)，但每个请求
+    需要独立的 Ack，否则:
+    A. 请求A的回显 Set 了全局 Ack，请求B 的 Wait 被误唤醒
+    B. 重试时无法区分"这次 Set 是谁的回显"
+
+所以 Ack 必须是实例字段 (每个 wr 一个)，不能是 static。
+
+不过注意: 同一时刻只有一个 activeWrite，Handle 收到回显
+只 Set activeWrite.Ack，所以虽然每个 wr 都有 Ack，但
+同一时刻只有一个 Ack 在被 Wait。Ack 的"独立"是为了
+"请求隔离"，不是为了"并发等待"。
+
+【六、Ack 与 activeWrite 的配合】
+------------------------------------------------------------
+Ack 解决"信号归属"问题，activeWrite 解决"回显归属"问题:
+
+  activeWrite (static volatile WriteRequest)
+    = "当前写线程正在等哪个请求的回显"
+    由 WriteLoop/ExecuteWrite 设置，Handle 读取
+    作用: Handle 收到 0x05 时，把回显分发给 activeWrite
+
+  wr.Ack (实例字段)
+    = "这个请求的应答信号"
+    由 Handle Set，ExecuteWrite Wait
+    作用: 唤醒正在等这个请求的写线程
+
+两者配合:
+  Handle: aw = activeWrite; ... aw.Ack.Set();
+  ExecuteWrite: activeWrite = wr; ... wr.Ack.WaitOne();
+
+如果只有 Ack 没有 activeWrite:
+  Handle 收到 0x05 不知道该 Set 哪个 wr 的 Ack
+  (虽然同一时刻只有一个在 Wait，但 Handle 无法直接知道)
+
+如果只有 activeWrite 没有 Ack:
+  ExecuteWrite 无法阻塞等应答 (只能轮询 activeWrite 状态，
+   浪费 CPU 且响应慢)
+
+【七、诚实补充: 你问题里的"自己"指谁?】
+------------------------------------------------------------
+你问:"它自己在发送请求后，自己还要等到应答结果?"
+
+"它"指 WriteRequest 对象。严格说，对象不"自己等"，
+是执行流(线程)在等。但你的直觉是对的:
+
+  WriteRequest 既是"请求载体"(携带 Slave/Addr/Frame 等数据)
+  又是"同步载体"(携带 Ack/Completed 信号)
+
+这种"数据+信号"打包的设计，让每个写请求自包含:
+  - 投递到队列的是 wr
+  - 写线程发 wr.Frame，等 wr.Ack
+  - 接收线程回显 wr.Ack.Set()
+  - 调用方等 wr.Completed
+
+整个生命周期里，所有参与者都通过同一个 wr 对象协调，
+不需要额外的全局状态。这是"对象携带自己的同步原语"
+的典型设计，比"全局信号+外部映射"更清晰、更不易错。
+
+【八、总结】
+------------------------------------------------------------
+Ack 存在的根本原因:
+  写操作是"请求-应答"模式，发送方发出帧后必须等回显
+  才能确认成功。Ack 就是这个"等回显"的同步信号。
+
+为什么是实例字段而非 static:
+  支持多请求隔离，每个 WriteRequest 自带独立 Ack。
+
+为什么用 AutoResetEvent:
+  匹配重试循环"一次 Set 唤醒一次 Wait"的语义。
+
+与 Completed 的分工:
+  Ack = 单次发送的应答信号 (ExecuteWrite 用，每轮重试)
+  Completed = 整个请求的最终信号 (调用方用，一次)
+
+你的理解"发送请求后还要等应答"正确，精确说是:
+  写线程(WriteLoop)通过 ExecuteWrite 发送 wr.Frame 后，
+  阻塞等 wr.Ack，由接收线程(Handle)收到回显后 Set 唤醒。
+============================================================
+分析结束
+============================================================

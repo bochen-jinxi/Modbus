@@ -1,0 +1,202 @@
+============================================================
+DiscardInBuffer + buf.Clear 是否误清 SendLoop 应答分析
+============================================================
+分析时间: 2026-11-03
+问题: ExecuteWrite 每轮重试前的 DiscardInBuffer + buf.Clear
+      (Program.cs:576-577) 会不会把 SendLoop 轮询请求的
+      应答误清除了?
+============================================================
+
+【一、直接回答】
+------------------------------------------------------------
+不会误清。但有前提: busLock 互斥正常工作。
+
+核心原因: ExecuteWrite 在 lock(busLock) 内执行，
+而 SendLoop 用 Monitor.TryEnter(busLock, 0) 非阻塞试，
+拿不到就跳过本轮读。所以 ExecuteWrite 清缓冲时，
+SendLoop 不可能正在等应答——它根本没发出请求。
+
+但存在一个理论上的时序缝隙 (见第四节)，实际不会造成误清，
+原因也要讲清楚。
+
+【二、锁互斥分析 (为什么不会误清)】
+------------------------------------------------------------
+代码结构:
+
+  SendLoop (Program.cs:172-229):
+    while (running):
+      if (!Monitor.TryEnter(busLock, 0))  // 非阻塞试
+          sleep(15); continue;            // 拿不到就跳过
+      try:
+          发读请求 → 等应答 → (超时则清缓冲)
+      finally:
+          Monitor.Exit(busLock)
+
+  WriteLoop (Program.cs:543-559):
+    while (running):
+      dequeue wr
+      lock (busLock):                     // 阻塞等
+          ExecuteWrite(wr)                // 内含 DiscardInBuffer+buf.Clear
+      wr.Completed.Set()
+
+  ExecuteWrite (Program.cs:563-623):
+    for attempt = 1..3:
+        lock(io) sp.DiscardInBuffer()     // ★ 被问的这行
+        lock(gate) buf.Clear()            // ★ 被问的这行
+        activeWrite = wr
+        sp.Write(frame)
+        wr.Ack.WaitOne(50ms)
+
+关键: ExecuteWrite 整个执行过程都在 lock(busLock) 内
+(WriteLoop 第553行 lock(busLock) 包住 ExecuteWrite)。
+
+所以 ExecuteWrite 执行 DiscardInBuffer+buf.Clear 时:
+  - WriteLoop 持有 busLock
+  - SendLoop 的 TryEnter(busLock, 0) 必然失败 → 跳过
+  - SendLoop 不在发请求、不在等应答
+  → 没有 SendLoop 的应答在 buf 里可清
+
+结论: busLock 保证了"清缓冲"与"读请求"互斥，
+不会误清 SendLoop 的应答。
+
+【三、buf 里此刻有什么?】
+------------------------------------------------------------
+ExecuteWrite 清缓冲时，buf 里可能有:
+
+1. 上一轮写请求的迟到回显 (0x05 帧)
+   - 比如 attempt=1 超时后，从站迟到回显
+   - 正是要清的! 清掉正确，防止干扰 attempt=2
+
+2. 上一轮写请求的残帧 (不完整 0x05)
+   - 同上，要清
+
+3. SendLoop 的读应答 (0x03 帧)?
+   - ★ 这是被问的情况
+   - 不会出现! 因为 SendLoop 此刻拿不到 busLock，
+     没发读请求，从站不会回读应答
+   - 除非: 从站主动发送 (Modbus 从站不主动发，只应答)
+   - 或: SendLoop 上一轮的迟到读应答
+
+4. SendLoop 上一轮的迟到读应答
+   - ★ 这是真正需要分析的! 见下节
+
+【四、真正的时序缝隙: SendLoop 迟到应答】
+------------------------------------------------------------
+场景:
+  t=0:  SendLoop 拿到 busLock，发读请求(从站1, 0x03)
+  t=50: SendLoop 等应答超时 (50ms 没来)，执行清缓冲
+        (215-216行)，释放 busLock
+  t=55: 从站1 的迟到读应答到达串口 → OnData → buf
+        (但 SendLoop 已清过 buf 并 Reset frameReceived)
+  t=60: WriteLoop 拿到 busLock，ExecuteWrite 开始
+  t=61: ExecuteWrite 执行 DiscardInBuffer+buf.Clear
+        → ★ 清掉了从站1 的迟到读应答!
+
+这个场景里，ExecuteWrite 确实清掉了 SendLoop 的迟到应答。
+但这是"误清"吗?
+
+分析: 不是误清，是正确清理。理由:
+  1. SendLoop 已超时放弃这个应答 (t=50 已 return)
+  2. SendLoop 已在 t=50 清过一次 buf (215-216行)
+     但应答在 t=55 才到，所以 t=50 的清没清到
+  3. 这个迟到应答是"孤儿数据":
+     - SendLoop 不要了 (已超时)
+     - WriteLoop 不认识 (不是 0x05 回显)
+  4. 如果不清，它会留在 buf 里:
+     - WriteLoop 发 0x05 后，OnData 把 0x05 回显追加到 buf
+     - buf = [迟到读应答] + [0x05回显]
+     - DrainInLock 切帧: 先切读应答(0x03) → Handle
+       → Handle 发现 func=0x03，frameReceived.Set()
+       → 但没人等 frameReceived (WriteLoop 等 wr.Ack)
+       → 然后切 0x05 回显 → Handle → aw.Ack.Set() ✓
+     - 看似不影响? 但增加了无谓处理，且 frameReceived 被
+       错误 Set，可能唤醒下一轮 SendLoop 的 Wait (误判成功)
+
+  5. 所以 ExecuteWrite 清掉它，是正确的! 避免了:
+     - 迟到读应答干扰写回显的切帧
+     - frameReceived 被错误 Set 导致 SendLoop 误判
+
+结论: ExecuteWrite 清掉的"SendLoop 迟到应答"是孤儿数据，
+清掉它不仅不是误清，反而是必要的正确清理。
+
+【五、反过来: SendLoop 清缓冲会误清 WriteLoop 应答吗?】
+------------------------------------------------------------
+对称问题: SendLoop 超时清缓冲 (215-216行) 会误清写回显吗?
+
+分析: 不会。理由:
+  1. SendLoop 清缓冲发生在它持有 busLock 期间
+     (178行 TryEnter 成功 → 215行清 → 224行 Exit)
+  2. WriteLoop 拿 busLock 是阻塞 lock (553行)
+     → SendLoop 持有期间，WriteLoop 在 lock(busLock) 处等待
+     → WriteLoop 没发写请求，没有写回显在 buf 里
+  3. buf 里可能有: WriteLoop 上一轮的迟到写回显
+     → 同第四节分析，是孤儿数据，清掉正确
+
+所以两个方向的清缓冲都不会误清"还在等的应答"，
+只会清"已超时放弃的孤儿应答"，这是正确的。
+
+【六、OnData 不受 busLock 保护，会不会有问题?】
+------------------------------------------------------------
+关键: OnData (接收事件回调) 不加 busLock，随时可能被触发。
+那 ExecuteWrite 清缓冲时，OnData 正好往 buf 加数据怎么办?
+
+代码:
+  ExecuteWrite 576-577:
+    lock (io) { sp.DiscardInBuffer(); }
+    lock (gate) { buf.Clear(); }
+
+  OnData 247-252:
+    lock (gate) {
+        buf.AddRange(tmp);
+        ...
+        frames = DrainInLock();
+    }
+
+两者都 lock(gate)，互斥! 所以:
+  - 要么 ExecuteWrite 先清完 buf，OnData 再加 (清完后新数据)
+  - 要么 OnData 先加完，ExecuteWrite 再清 (新数据被清)
+
+第二种情况: OnData 刚加的数据被 ExecuteWrite 清了。
+这是问题吗?
+
+  - OnData 加的数据是"清缓冲瞬间到达的串口数据"
+  - 如果是写回显: ExecuteWrite 马上要 sp.Write 发新帧，
+    然后等 wr.Ack。被清的回显会导致这轮超时，但会重试。
+    影响: 多一次重试，不是错误。
+  - 如果是读应答: 孤儿数据 (SendLoop 没在等)，清掉正确。
+  - 如果是上一轮的迟到回显: 正是要清的。
+
+所以 OnData 与清缓冲的竞态，最坏后果是多一次重试，
+不会误清"当前正在等的应答" (因为当前应答还没到，
+ExecuteWrite 还没 sp.Write 发当前帧)。
+
+【七、完整时序验证: 一个写请求的清缓冲时机】
+------------------------------------------------------------
+ExecuteWrite 第 N 轮重试:
+
+  step1: DiscardInBuffer + buf.Clear  (576-577行) ← 被问的这行
+  step2: activeWrite = wr              (581行)
+  step3: sp.Write(frame)               (590行) ← 发送当前帧
+  step4: wr.Ack.WaitOne(50ms)          (604行) ← 等当前帧回显
+
+清缓冲 (step1) 发生在发送 (step3) 之前!
+所以清缓冲时，当前帧的回显还没发出去，不可能在 buf 里。
+buf 里只有"历史数据" (上一轮迟到应答/孤儿应答)，清掉正确。
+
+当前帧的回显在 step3 之后才到达，step1 早已完成，
+不会清到它。这是时序上的根本保证。
+
+【八、总结】
+------------------------------------------------------------
+1. busLock 互斥保证: ExecuteWrite 清缓冲时 SendLoop 没在等应答
+2. 清掉的"SendLoop 迟到应答"是孤儿数据，清掉正确
+3. OnData 与清缓冲的竞态: 最坏多一次重试，不误清当前应答
+4. 根本时序保证: 清缓冲在发送之前，当前帧回显还没产生
+5. 不会误清 SendLoop 正在等的应答 (因为 SendLoop 没在等)
+6. 不会误清 WriteLoop 当前轮的回显 (因为还没发送)
+
+你的担忧是合理的 (清缓冲确实激进)，但在 busLock 互斥 +
+时序 (清在发前) 的双重保证下，不会误清有效应答。
+============================================================
+分析结束
+============================================================
