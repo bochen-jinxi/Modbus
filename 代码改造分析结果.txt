@@ -1,0 +1,185 @@
+Modbus RTU 多从站轮询程序 - 代码改造分析结果
+====================================================
+
+一、改造范围（一段总览）
+本次改造针对 F:\chenbo\Program.cs（364行，C# .NET8 控制台版 Modbus RTU 主站），修复4个问题：BUG3（第129行 Thread.SpinWait 把10ms间隔塌缩成≈0，发送线程疯狂连发刷爆总线）、BUG4（第39行 TimeoutMs=12ms 比正常应答时间18ms还短，每站必超时）、OnFrameGap竞态（第179行 Drain和取残帧两次独立加锁，中间窗口新字节被误清）、锁内Console（第148行打印在lock(gate)内，高波特率下锁持有从微秒放大到毫秒）。前两个是致命级（程序完全读不到数据），后两个是竞态/瑕疵级。修复后程序应能正常轮询两从站、稳定解析温湿度。
+
+二、4个问题逐行实锤（问题先列，方案后写）
+
+【BUG3·致命·第129行】Thread.SpinWait(IntervalMs) 把10ms间隔变成≈0
+  原代码：Thread.SpinWait(IntervalMs);   // IntervalMs=10
+  根因：SpinWait(int iterations) 参数是自旋迭代次数不是毫秒。SpinWait(10) 只烧约几十纳秒就返回。
+  后果链（一条龙）：
+    1.发送线程无间隔疯狂连发 → RS485半双工总线被同一主站刷爆
+    2.从站来不及应答前一站，下一站请求已到 → 总线冲突
+    3.curSlave 被飞速覆盖 → 上一站应答到达时curSlave已变 → 全部判"迟到应答"忽略
+    4.CPU一个核被SpinWait烧满 → FrameGapLoop（也用SpinWait）抢不到时间片 → 帧超时检测失效
+    5.净效果：所有从站永远超时，温湿度永远读不到，但日志刷屏像"在正常工作"
+  修复：Thread.Sleep(IntervalMs);   // 改回Sleep，10ms间隔精度15ms级够用
+  为什么不用PreciseSleepMs：那是给FrameGapLoop的3.65ms级精度用的，发送间隔不需要那么精，且Sleep不烧CPU。
+
+【BUG4·致命·第39行】TimeoutMs = 12 偏紧，正常应答都超时
+  原代码：const int TimeoutMs = 12;
+  根因：9600bps下一次交互约18ms（发8字节+收8字节+从站处理），12ms超时意味着正常应答来不及到。
+        代码注释自己写"实测30ms偏紧（超时18次），50ms稳（超时3次）"，但值是12ms——比注释说的偏紧30ms还紧2.5倍。
+  后果链：每站每轮必超时 → 超时分支清buf+Reset信号+轮下一站 → 即使应答随后到达也被frame[0]!=curSlave忽略 → 永远读不到数据。
+  修复：const int TimeoutMs = 50;   // 实测稳定值
+
+【OnFrameGap竞态·第179行】Drain()和取残帧两次独立加锁，中间窗口新字节被误清
+  原代码：
+    static void OnFrameGap()
+    {
+        Drain();              // ① 第一次lock(gate)，切走完整帧，释放gate
+        byte[] rest = null;
+        lock (gate)           // ② 第二次lock(gate)，取残帧
+        {
+            if (buf.Count > 0) { rest = buf.ToArray(); buf.Clear(); }
+        }
+        if (rest != null) Handle(rest);
+    }
+  竞态时序（①释放gate → ②拿到gate 之间）：
+    t0  Drain()释放gate
+    t1  OnData抢到gate，buf.AddRange(新字节X)  // X是下一帧的开头
+    t2  OnData释放gate
+    t3  OnFrameGap抢到gate，rest=buf.ToArray()含X，buf.Clear()  // X被当残帧清掉
+    t4  下一帧因开头X丢失，CRC错，整帧丢弃
+  触发概率：9600下3.65ms窗口短，需新字节恰好在此窗口且OnData抢先；115200下0.3ms窗口概率上升。
+  修复：把切残帧逻辑放进同一个lock（Drain拆成DrainInLock内部不加锁 + 外壳Drain加锁后调DrainInLock）：
+    static void OnFrameGap()
+    {
+        byte[] rest = null;
+        lock (gate)                       // 一次加锁，原子
+        {
+            DrainInLock();                // 切完整帧（内部不再加锁）
+            if (buf.Count > 0) { rest = buf.ToArray(); buf.Clear(); }
+        }
+        if (rest != null) Handle(rest);   // Handle在锁外，只读frame数组不碰buf，安全
+    }
+  代价：Handle在锁外调用，但Handle只读已拷贝的frame数组，不碰buf，锁外安全。
+
+【锁内Console·第148行】Console.WriteLine 在 lock(gate) 内，高波特率下锁持有放大
+  原代码：
+    lock (gate)
+    {
+        buf.AddRange(tmp);
+        Console.WriteLine($"    >>> 收到 {tmp.Length} 字节，缓冲区现有 {buf.Count} 字节");  // 锁内IO
+    }
+  根因：控制台打印是毫秒级IO，持gate期间Drain/OnFrameGap/超时清空全被阻塞。
+  修复：挪到锁外（先在锁内取count，出锁再打印）：
+    int count;
+    lock (gate)
+    {
+        buf.AddRange(tmp);
+        count = buf.Count;
+    }
+    Console.WriteLine($"    >>> 收到 {tmp.Length} 字节，缓冲区现有 {count} 字节");
+
+三、修复优先级与依赖关系
+
+优先级 | 问题              | 行号 | 不修的后果                   | 修复难度
+-------|-------------------|------|------------------------------|--------
+P0·致命| BUG3 SpinWait     | 129  | 程序完全读不到数据，CPU烧满  | 1行
+P0·致命| BUG4 TimeoutMs=12 | 39   | 每站必超时，读不到数据       | 1行
+P1·竞态| OnFrameGap两次锁  | 179  | 高波特率下偶丢帧             | 重构Drain
+P2·瑕疵| 锁内Console       | 148  | 高波特率下锁持有放大         | 3行
+
+依赖关系：BUG3和BUG4独立，可分别修。OnFrameGap竞态修复要改Drain结构，建议最后做。锁内Console修复独立。
+
+四、Drain拆分说明（OnFrameGap竞态修复的关键）
+
+原Drain结构（外壳加锁 + 内部while循环）：
+  static void Drain()
+  {
+      while (true)
+      {
+          byte[] frame = null;
+          lock (gate) { ...切帧... }
+          if (frame == null) return;
+          Handle(frame);
+      }
+  }
+
+拆分后：
+  1. DrainInLock() —— 假设调用者已持gate锁，内部不再加锁，切完所有完整帧返回List<frame>
+  2. Drain()      —— 外壳，lock(gate)后调DrainInLock，出锁后逐个Handle
+
+  static List<byte[]> DrainInLock()
+  {
+      var frames = new List<byte[]>();
+      while (buf.Count >= 3)
+      {
+          int len = FrameLength(buf, 0);
+          if (len < 0) break;
+          if (buf.Count < len) break;
+          byte[] frame = new byte[len];
+          buf.CopyTo(0, frame, 0, len);
+          if (CrcOk(frame)) { buf.RemoveRange(0, len); frames.Add(frame); }
+          else { buf.RemoveRange(0, 1); }   // CRC错滑动1字节
+      }
+      return frames;
+  }
+
+  static void Drain()
+  {
+      List<byte[]> frames;
+      lock (gate) { frames = DrainInLock(); }
+      foreach (var f in frames) Handle(f);
+  }
+
+  OnFrameGap改为：
+  static void OnFrameGap()
+  {
+      List<byte[]> frames;
+      byte[] rest = null;
+      lock (gate)
+      {
+          frames = DrainInLock();
+          if (buf.Count > 0) { rest = buf.ToArray(); buf.Clear(); }
+      }
+      foreach (var f in frames) Handle(f);
+      if (rest != null) Handle(rest);
+  }
+
+  好处：OnFrameGap里切完整帧+取残帧在一次lock内原子，窗口消失。
+  Handle全在锁外，不碰buf，安全。
+
+五、修复后验证要点
+
+1. 编译零错误零警告（dotnet build 或 csc 编译）
+2. 运行后日志应出现 [发送→从站01] → [收到帧] → [解析·从站01] → [温湿度·从站01] → [发送→从站02] 循环
+3. 不应出现 [超时] 刷屏（若从站在线且TimeoutMs=50足够）
+4. CPU占用正常（不再有SpinWait烧核）
+5. 高波特率下不偶丢帧（OnFrameGap竞态已修）
+
+六、诚实补充（所有我知道的信息）
+
+1. 这个程序是控制台版，F:\chenbo\Scada\ 是WPF上位机版（已编译通过的ChenboScada.exe）。
+   WPF版的引擎已经修了BUG3（用Thread.Sleep）、BUG2（先乘后除）、BUG1（删持锁Sleep），控制台版落后了。
+
+2. 运行流程分析.txt（856行）是之前32章的深入分析记录，本次改造是第33-35章的延续。
+   那份文档里第二十九章、第八章都点了BUG3，但控制台版Program.cs一直没修，这次才落代码。
+
+3. FrameGapLoop的PollMs=1.83ms（9600下），用PreciseSleepMs忙等会烧满一个CPU核。
+   这是已知的代价（分析文档第二十二章诚实补充第1点），不是BUG，是精度换CPU的取舍。
+   更省CPU的做法是Monitor.Wait/Pulse（分析文档第七章第3点提过），但代码没采用。
+
+4. 修复后如果仍然超时，排查顺序（分析文档第十二章口诀）：
+   「没字节查电线，字节烂查参数，帧好忽略查超时，都正常查对端配置」
+   - 没字节到：查供电/接线/串口选对没
+   - 字节到但CRC全烂：查波特率/校验位/数据位是否和从站一致
+   - 帧有效但[忽略]：从站应答慢，调大TimeoutMs
+   - 都正常：查Modbus Slave模拟器配置（分析文档第十三章实锤过模拟器ID配错的案例）
+
+5. TimeoutMs=50是9600bps下的稳定值。若换115200bps，一次交互约1.5ms，50ms余量巨大但无妨；
+   若从站处理慢（如某些PLC应答要100ms），50ms仍会超时，需按实际调大。
+
+6. OnFrameGap竞态修复后，Drain的Handle调用从"锁内break后立即调"变成"收集完出锁后批量调"。
+   行为差异：原版切一帧立即Handle，新版切完所有帧再批量Handle。对单帧场景无差异，
+   对粘包（buf里有多帧）场景，新版先切完再解析，延迟增加微秒级，可忽略。
+
+七、记忆口诀
+
+「SpinWait参数是迭代不是毫秒，129行间隔塌零总线刷爆；TimeoutMs=12比注释的30还紧2.5倍，正常应答都超时；
+ OnFrameGap两次锁中间窗口新字节被误清，合并成一次锁原子；锁内打印是毫秒IO，挪锁外先取数后打印」
+
+「修复优先级：P0两行改值（SpinWait→Sleep、12→50），P1重构Drain拆锁，P2挪打印出锁」

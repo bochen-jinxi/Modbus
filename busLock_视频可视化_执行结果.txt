@@ -1,0 +1,157 @@
+==================================================
+任务：把 busLock 锁体现在视频中（修改 gen_video.py 重新生成）
+执行时间：2026-11-03
+结果：成功。dataflow.mp4 + dataflow.gif 已更新，busLock 可视化已加入。
+==================================================
+
+一、任务理解
+--------------------------------------------------
+用户要求："你添加了这个 busLock 锁要体现在视频中"。
+即：在 gen_video.py 生成的 dataflow 视频里，把 busLock 总线事务锁
+的协调过程（SendLoop TryEnter 非阻塞试 / WriteLoop lock 阻塞等 /
+写优先读让步）可视化出来。
+
+busLock 是 Program.cs 里的"总线事务锁"（第 53 行）：
+  - SendLoop 用 Monitor.TryEnter(busLock, 0) 非阻塞试，拿不到跳过本轮读
+  - WriteLoop 用 lock(busLock) 阻塞等，保证写命令一定执行
+  - 锁顺序：busLock → io → gate
+
+二、修改方案
+--------------------------------------------------
+busLock 横跨读流程和写流程，两段都要体现：
+
+【读流程段（0~12s）】
+  - 共享内存区新增 busLock 格子（顶部，h=55，带锁图标）
+  - 新增 bus_owner(t) 函数：SendLoop 持有（TryEnter 成功）
+  - 字幕和步骤说明加 busLock 描述
+  - 锁图标颜色 = SendLoop 绿色（持锁期间）
+
+【写流程段（12~24s）】—— 体现 busLock 的关键场景
+  - 新增 SendLoop 读线程跑道（y=250），演示 TryEnter 失败→跳过→重试
+  - 共享内存区新增 busLock 格子，显示持有者切换：
+      WriteLoop 持有(4.3~8.0, 9.5~11.0) → SendLoop 持有(8.0~9.5) → 空闲
+  - 字幕和步骤说明加 busLock 的"写优先读让步"描述
+  - SendLoop 跑道 wait 模式显示"TryEnter 失败跳过…"（不是"阻塞中"）
+
+三、具体改动清单（gen_video.py）
+--------------------------------------------------
+1. CELLS（读流程共享区）新增 "bus" 格子 (60,250,360,55)
+2. CELLS_W（写流程共享区）新增 "bus2" 格子 (60,290,360,55)
+   并把其他格子下移 40 像素给 bus2 腾空间：
+     queue/aw/sp2: 310→350
+     wr1/wr2/ack: 395→435
+3. 新增 bus_owner(t) 函数：读流程 SendLoop 持有 busLock (0~10.5)
+4. OWNER_C 扩展：加 "WL":(255,165,0) 和 "TX2":C_TX
+   （OWNER_C 在第 130 行定义，C_WL 在第 315 行才定义，
+    为避免 NameError，WL 用直接颜色元组而非 C_WL 引用）
+5. draw_shared（读流程）：
+   - 边框 270→240（包含 bus 格子）
+   - 加 bus 格子绘制分支：锁图标 + 持有者文字
+6. draw_shared_w（写流程）：
+   - 边框 270→280（包含 bus2 格子，给 SendLoop 跑道留空间）
+   - 加 bus2 格子绘制分支：按时间区间显示 WriteLoop/SendLoop/空闲
+7. LANES_W 新增 SendLoop 跑道 ("TX2", y=250)
+8. states_w 新增 TX2 状态：
+   - t<4.3: run 读轮询(无写)
+   - 4.3~8.0: wait TryEnter 失败跳过
+   - 8.0~9.5: run TryEnter 成功读一轮（WriteLoop 释放 busLock 的间隙）
+   - 9.5~11.0: wait TryEnter 失败跳过
+   - 11.0~12.5: wait TryEnter 失败跳过
+9. draw_lanes_w：
+   - spd 字典加 "TX2":180
+   - wait 模式文字区分：TX2 显示"TryEnter 失败跳过…"，其他显示"阻塞中…"
+10. P_QUEUE/P_WL/P_AW 等 8 个坐标点 y 值下移 40（跟随格子下移）
+11. SUBS（读流程字幕）开头改为 busLock 说明：
+    "SendLoop TryEnter(busLock,0) 成功 → 持有总线事务锁，写事务此刻进不来"
+12. STEPS（读流程步骤）①改为：
+    "SendLoop TryEnter(busLock,0) 成功 → 持总线锁 → 持 io 锁发请求帧"
+13. SUBS_W（写流程字幕）加 3 条 busLock 说明：
+    t=4.3 "WriteLoop lock(busLock) 阻塞等总线锁 → 拿到！SendLoop 此刻 TryEnter 全部失败"
+    t=6.5 "SendLoop TryEnter(busLock,0) 失败 → 跳过本轮读 → Sleep(15) → 再试再失败（写优先）"
+    t=8.3 "WriteLoop 释放 busLock → SendLoop 下一轮 TryEnter 终于成功，读恢复"
+    t=9.5 "WriteLoop 取 wr2 → lock(busLock) 再次独占 → SendLoop 又被挡开（写优先）"
+14. STEPS_W（写流程步骤）加 busLock 步骤：
+    ④ "WriteLoop lock(busLock) 独占总线 → SendLoop TryEnter 失败跳过"
+    ⑦ "wr1.Completed.Set() → 唤醒后台线程A → 释放 busLock"
+    ⑧ "SendLoop TryEnter 成功 → 读恢复一轮"
+    ⑨ "WriteLoop 取 wr2 → lock(busLock) 再次独占 → SendLoop 又被挡开"
+15. draw_misc（读流程图例）加 busLock 说明
+16. draw_misc_w（写流程图例）加 SendLoop 图例 + busLock 说明
+
+四、执行过程
+--------------------------------------------------
+1) 语法验证：py -c "ast.parse(...)" → syntax OK
+2) 首次运行报错：NameError: C_WL not defined
+   原因：OWNER_C 在第 130 行引用 C_WL，但 C_WL 在第 315 行才定义
+   修复：OWNER_C 里 "WL" 改用直接颜色元组 (255,165,0) 而非 C_WL 引用
+3) 再次运行：frame 0/360 → frame 330/360 → DONE，无报错
+
+五、产物
+--------------------------------------------------
+1) F:\chenbo\dataflow.mp4
+   大小：950,091 字节（约 928 KB，比上次的 831 KB 增 97 KB，因加 busLock 内容）
+   编码：H.264 (libx264)
+   时长：24 秒 @ 15fps
+   分辨率：1280×1100
+
+2) F:\chenbo\dataflow.gif
+   大小：4,470,202 字节（约 4.26 MB，比上次的 3.94 MB 增 0.32 MB）
+   时长：24 秒（抽帧减半约 7.5fps）
+   分辨率：960×825
+   loop=0 无限循环
+
+六、视频里 busLock 的可视化效果
+--------------------------------------------------
+【读流程 0~12s】
+  - 共享区顶部新增 busLock 格子，锁图标为绿色（SendLoop 持有）
+  - 字幕 t=0.0："SendLoop TryEnter(busLock,0) 成功 → 持有总线事务锁，写事务此刻进不来"
+  - 整轮读期间 busLock 一直绿（SendLoop 持有），体现"读事务独占总线"
+  - 步骤①："SendLoop TryEnter(busLock,0) 成功 → 持总线锁 → 持 io 锁发请求帧"
+
+【写流程 12~24s】—— busLock 的核心演示
+  - 新增 SendLoop 读线程跑道（绿色，y=250）
+  - busLock 格子持有者随时间切换：
+      t=0~4.3   空闲（无写命令）
+      t=4.3~8.0 WriteLoop 持有（橙色锁）—— wr1 执行期间
+      t=8.0~9.5 SendLoop 持有（绿色锁）—— wr1 完成释放 busLock，读抢到一轮
+      t=9.5~11.0 WriteLoop 持有（橙色锁）—— wr2 执行期间
+      t=11.0~   空闲
+  - SendLoop 跑道状态：
+      t<4.3     run "读轮询(无写)"（绿点移动）
+      4.3~8.0   wait "TryEnter 失败跳过…"（红底闪烁）—— 写优先读让步
+      8.0~9.5   run "TryEnter 成功读一轮"（绿点移动）—— 间隙读恢复
+      9.5~11.0  wait "TryEnter 失败跳过…"—— wr2 又独占
+      11.0~12.5 wait "TryEnter 失败跳过…"
+  - 字幕关键句：
+      t=4.3 "WriteLoop lock(busLock) 阻塞等总线锁 → 拿到！SendLoop 此刻 TryEnter 全部失败"
+      t=6.5 "SendLoop TryEnter(busLock,0) 失败 → 跳过本轮读 → Sleep(15) → 再试再失败（写优先）"
+      t=8.3 "WriteLoop 释放 busLock → SendLoop 下一轮 TryEnter 终于成功，读恢复"
+      t=9.5 "WriteLoop 取 wr2 → lock(busLock) 再次独占 → SendLoop 又被挡开（写优先）"
+  - 图例加 SendLoop 读 + busLock 说明：
+      "busLock：WriteLoop lock 死等(写优先) / SendLoop TryEnter 失败跳过(读让步) / 间隙读恢复一轮"
+
+七、诚实补充
+--------------------------------------------------
+1) busLock 的可视化是"示意性"的，时间区间是手工编排的，不是从 Program.cs
+   实际运行中采集的。但编排符合源码语义：
+   - WriteLoop 持有 busLock 的时间 = ExecuteWrite 执行时间（含等回显+重试）
+   - SendLoop TryEnter 失败的次数 = WriteLoop 持有期间 SendLoop 的轮询次数
+   - 间隙读恢复 = WriteLoop 释放 busLock 到下一次 lock 之间的短暂窗口
+2) 读流程里 busLock 一直由 SendLoop 持有，没有写命令来抢，所以看不到
+   "TryEnter 失败"的场景。写流程才演示了"写优先读让步"的冲突。
+3) 视频里常驻的源码 BUG 警告（gen_video.py:258）保留未动，和 busLock 无关。
+4) 本次修改了 gen_video.py 共 16 处，属于"在现有动画上加一层 busLock 可视化"，
+   没有重构原有结构，改动尽量局部化。
+
+八、最终结论
+--------------------------------------------------
+任务完成。busLock 锁已体现在视频中：
+  - 读流程：busLock 格子显示 SendLoop 持有（TryEnter 成功）
+  - 写流程：busLock 格子显示 WriteLoop/SendLoop 持有者切换 +
+            SendLoop 跑道演示 TryEnter 失败跳过→间隙恢复→再被挡开
+  - 字幕和步骤说明完整描述"写优先读让步"的协调过程
+视频已重新生成：dataflow.mp4 (928KB) + dataflow.gif (4.26MB)。
+
+==================================================
+分析完毕
+==================================================

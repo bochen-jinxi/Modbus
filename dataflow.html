@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Modbus RTU 数据流转动画</title>
+<style>
+  body { background:#0f1420; color:#dfe6f0; font-family:Consolas,"Microsoft YaHei",monospace; margin:0; padding:16px; }
+  h2 { margin:0 0 8px; font-size:18px; }
+  #stage { width:100%; }
+  .box { fill:#1a2333; stroke:#3a4a63; stroke-width:2; rx:8; }
+  .box.active { stroke:#ffd54a; stroke-width:3; }
+  .lbl { fill:#9fb3d1; font-size:13px; }
+  .big { fill:#e8eef7; font-size:14px; font-weight:bold; }
+  .msg { font-size:14px; fill:#ffd54a; }
+  .cell { fill:#101827; stroke:#33415c; }
+  .cell.on { fill:#2e86ff; stroke:#7db4ff; }
+  .log { font-size:12px; fill:#8fd3a0; }
+</style>
+</head>
+<body>
+<h2>Modbus RTU 多从站轮询 · 数据流转动态演示（循环播放）</h2>
+<svg id="stage" viewBox="0 0 1000 620">
+  <!-- 线程/模块框 -->
+  <rect id="bTx"  class="box" x="40"  y="60"  width="220" height="90" rx="8"/>
+  <text class="big" x="70"  y="90">SendLoop 发送线程</text>
+  <text class="lbl" x="60"  y="115">轮询从站 0x01 / 0x02</text>
+  <text class="lbl" x="60"  y="135">lock(io) 写串口 → 等信号 50ms</text>
+
+  <rect id="bSp"  class="box" x="400" y="40"  width="200" height="70" rx="8"/>
+  <text class="big" x="440" y="70">串口 COM4</text>
+  <text class="lbl" x="430" y="92">RS485 半双工 9600bps</text>
+
+  <rect id="bRx"  class="box" x="720" y="60"  width="240" height="90" rx="8"/>
+  <text class="big" x="750" y="90">OnData 接收线程</text>
+  <text class="lbl" x="735" y="115">lock(io) 读字节</text>
+  <text class="lbl" x="735" y="135">lock(gate) 追加 buf</text>
+
+  <!-- buf 缓冲区 -->
+  <rect id="bBuf" class="box" x="380" y="220" width="240" height="110" rx="8"/>
+  <text class="big" x="430" y="248">buf 缓冲区 (gate)</text>
+  <g id="cells"></g>
+
+  <rect id="bFx"  class="box" x="40"  y="220" width="240" height="90" rx="8"/>
+  <text class="big" x="60"  y="250">FrameGapLoop 检测线程</text>
+  <text class="lbl" x="55"  y="275">Stopwatch 微秒轮询</text>
+  <text class="lbl" x="55"  y="295">> 3.5字符(3.65ms)判帧尾</text>
+
+  <rect id="bDr"  class="box" x="380" y="400" width="240" height="90" rx="8"/>
+  <text class="big" x="440" y="430">Drain / Handle</text>
+  <text class="lbl" x="400" y="455">切帧 → CRC16 → 比对 curSlave</text>
+  <text class="lbl" x="400" y="475">解析温湿度 → Set 信号</text>
+
+  <!-- 静默计时条 -->
+  <text class="lbl" x="650" y="230">帧间静默计时：</text>
+  <rect x="650" y="240" width="200" height="12" fill="#101827" stroke="#33415c"/>
+  <rect id="gap" x="650" y="240" width="0" height="12" fill="#ffb74d"/>
+
+  <!-- 消息与日志 -->
+  <text id="step" class="msg" x="40" y="30">准备…</text>
+  <text id="out"  class="log" x="40" y="560"></text>
+  <text id="out2" class="log" x="40" y="585"></text>
+
+  <!-- 移动的数据点 -->
+  <circle id="p0" r="7" fill="#7CFC00" visibility="hidden"/>
+  <circle id="p1" r="6" fill="#4db2ff" visibility="hidden"/>
+  <circle id="p2" r="6" fill="#4db2ff" visibility="hidden"/>
+  <circle id="p3" r="6" fill="#4db2ff" visibility="hidden"/>
+  <circle id="p4" r="8" fill="#ffd54a" visibility="hidden"/>
+  <circle id="p5" r="8" fill="#ff7db0" visibility="hidden"/>
+</svg>
+
+<script>
+const $ = id => document.getElementById(id);
+const cells = $("cells");
+for (let i = 0; i < 8; i++) {
+  const r = document.createElementNS("http://www.w3.org/2000/svg","rect");
+  r.setAttribute("class","cell");
+  r.setAttribute("x", 400 + i*27);
+  r.setAttribute("y", 265);
+  r.setAttribute("width", 22);
+  r.setAttribute("height", 26);
+  cells.appendChild(r);
+}
+const cellEls = [...cells.children];
+
+// 关键坐标
+const P = {
+  tx:[150,105], sp:[500,75], rx:[840,105],
+  buf:[500,278], bufIn:[620,278],
+  fx:[160,265], dr:[500,445]
+};
+
+function move(dot, from, to, t0, t1, now) {
+  if (now < t0 || now > t1) { dot.setAttribute("visibility","hidden"); return; }
+  const k = (now - t0) / (t1 - t0);
+  dot.setAttribute("cx", from[0] + (to[0]-from[0]) * k);
+  dot.setAttribute("cy", from[1] + (to[1]-from[1]) * k);
+  dot.setAttribute("visibility","visible");
+}
+function setActive(id, on) { $(id).classList.toggle("active", on); }
+function fillBuf(n) { cellEls.forEach((c,i)=>c.classList.toggle("on", i<n)); }
+
+// 时间线（单位 ms，总长 LOOP 循环）
+const LOOP = 12000;
+const T0 = performance.now();
+
+const steps = [
+  [0,    "① 发送线程：curSlave=0x01，lock(io) 发出 8 字节请求帧 01 03 00 00 00 02 CRC"],
+  [1500, "② 从站应答：字节分 3 批经串口流入 OnData"],
+  [3000, "③ OnData：lock(gate) 追加 buf，Interlocked 记录最后接收时刻"],
+  [4800, "④ 字节流停：FrameGapLoop 检测静默 ≥ 3.5 字符(3.65ms) → 判帧结束"],
+  [6200, "⑤ Drain：按 FrameLength 切走完整帧（03 应答 = 3+字节数+2 = 9 字节）"],
+  [7600, "⑥ Handle：CRC16 校验通过，frame[0]==curSlave 匹配，解析温湿度"],
+  [9000, "⑦ frameReceived.Set() → 唤醒发送线程，idx 切到从站 0x02，发下一帧"],
+  [10600,"—— 一轮完成，循环 ——"]
+];
+
+function frame() {
+  const now = (performance.now() - T0) % LOOP;
+  let label = "";
+  for (const [t, s] of steps) if (now >= t) label = s;
+  $("step").textContent = label;
+
+  setActive("bTx", now < 1500 || now >= 9000 && now < 10600);
+  setActive("bSp", now < 3000);
+  setActive("bRx", now >= 1500 && now < 4800);
+  setActive("bFx", now >= 4800 && now < 6200);
+  setActive("bDr", now >= 6200 && now < 9000);
+
+  // ① 请求帧：Tx -> Sp
+  move($("p0"), P.tx, P.sp, 200, 1400, now);
+
+  // ② 应答分3批：Sp -> Rx
+  move($("p1"), P.sp, P.rx, 1600, 2400, now);
+  move($("p2"), P.sp, P.rx, 2100, 2900, now);
+  move($("p3"), P.sp, P.rx, 2500, 3000, now);
+
+  // ③ Rx -> buf，buf 逐批填充 3/6/9
+  move($("p1"), P.rx, P.bufIn, 3100, 3800, now);
+  move($("p2"), P.rx, P.bufIn, 3500, 4200, now);
+  move($("p3"), P.rx, P.bufIn, 3900, 4600, now);
+  fillBuf(now < 3100 ? 0 : now < 3500 ? 3 : now < 3900 ? 6 : now < 6200 ? 9 : 0);
+
+  // ④ 静默计时条
+  const g = now >= 4800 && now < 6200 ? (now - 4800) / 1400 * 200 : 0;
+  $("gap").setAttribute("width", g);
+  move($("p4"), P.fx, P.buf, 5000, 6100, now);   // Fx 触发 OnFrameGap
+
+  // ⑤ 整帧 buf -> Drain
+  move($("p4"), P.buf, P.dr, 6300, 7500, now);
+
+  // ⑥ 解析输出
+  $("out").textContent  = now >= 7600 ? "[解析·从站01] 共2个寄存器：[0]=253 [1]=605" : "";
+  $("out2").textContent = now >= 8300 ? "[温湿度·从站01] 温度 25.3 ℃，湿度 60.5 %RH   CRC OK" : "";
+
+  // ⑦ Set 信号：Drain -> Tx
+  move($("p5"), P.dr, P.tx, 9000, 10500, now);
+
+  requestAnimationFrame(frame);
+}
+frame();
+</script>
+
+<hr style="margin:24px 0;border-color:#33415c"/>
+<h2>多按钮写操作 · 队列+独立信号异步通信（改造后）</h2>
+<svg id="stage2" viewBox="0 0 1000 620">
+  <!-- 提交方（多个按钮） -->
+  <rect class="box" x="40"  y="60"  width="200" height="70" rx="8"/>
+  <text class="big" x="60"  y="90">按钮A / CmdLoop</text>
+  <text class="lbl" x="55"  y="115">new wr1 → Enqueue → 立即返回</text>
+
+  <rect class="box" x="40"  y="150" width="200" height="70" rx="8"/>
+  <text class="big" x="60"  y="180">按钮B / CmdLoop</text>
+  <text class="lbl" x="55"  y="205">new wr2 → Enqueue → 立即返回</text>
+
+  <!-- 写队列 -->
+  <rect id="bQ" class="box" x="300" y="100" width="200" height="120" rx="8"/>
+  <text class="big" x="330" y="130">writeQueue</text>
+  <text class="lbl" x="315" y="155">ConcurrentQueue</text>
+  <g id="qcells"></g>
+  <text class="lbl" x="315" y="200">多线程无锁 Enqueue</text>
+
+  <!-- WriteLoop 写线程 -->
+  <rect id="bWl" class="box" x="560" y="80" width="220" height="90" rx="8"/>
+  <text class="big" x="580" y="110">WriteLoop 写线程</text>
+  <text class="lbl" x="570" y="135">TryDequeue → 串行执行</text>
+  <text class="lbl" x="570" y="155">保证 RS485 一次一帧</text>
+
+  <!-- ExecuteWrite -->
+  <rect id="bEx" class="box" x="560" y="220" width="220" height="90" rx="8"/>
+  <text class="big" x="580" y="250">ExecuteWrite</text>
+  <text class="lbl" x="570" y="275">activeWrite=wr → sp.Write</text>
+  <text class="lbl" x="570" y="295">wr.Ack.WaitOne 等回显</text>
+
+  <!-- 串口 -->
+  <rect id="bSp2" class="box" x="820" y="150" width="150" height="70" rx="8"/>
+  <text class="big" x="850" y="180">串口 COM4</text>
+  <text class="lbl" x="835" y="205">lock(io) 写</text>
+
+  <!-- Handle 接收 -->
+  <rect id="bHd" class="box" x="560" y="360" width="220" height="80" rx="8"/>
+  <text class="big" x="590" y="390">Handle 接收</text>
+  <text class="lbl" x="570" y="415">收到0x05回显 → 比对 activeWrite</text>
+  <text class="lbl" x="570" y="432">aw.AckOk=true → aw.Ack.Set()</text>
+
+  <!-- 后台打印线程 -->
+  <rect id="bBg" class="box" x="40"  y="360" width="220" height="80" rx="8"/>
+  <text class="big" x="60"  y="390">后台打印线程</text>
+  <text class="lbl" x="50"  y="415">ThreadPool 回调</text>
+  <text class="lbl" x="50"  y="432">wr.Completed.Wait → 打印结果</text>
+
+  <!-- 信号量说明 -->
+  <rect class="box" x="300" y="360" width="220" height="80" rx="8"/>
+  <text class="big" x="330" y="390">每个 wr 独立信号</text>
+  <text class="lbl" x="310" y="415">Ack: Handle→ExecuteWrite</text>
+  <text class="lbl" x="310" y="432">Completed: WriteLoop→提交方</text>
+
+  <!-- 消息 -->
+  <text id="step2" class="msg" x="40" y="30">准备…</text>
+  <text id="out3"  class="log" x="40" y="480"></text>
+  <text id="out4"  class="log" x="40" y="505"></text>
+  <text id="out5"  class="log" x="40" y="530"></text>
+
+  <!-- 移动数据点 -->
+  <circle id="q0" r="7" fill="#7CFC00" visibility="hidden"/>
+  <circle id="q1" r="7" fill="#4db2ff" visibility="hidden"/>
+  <circle id="q2" r="8" fill="#ffd54a" visibility="hidden"/>
+  <circle id="q3" r="8" fill="#ff7db0" visibility="hidden"/>
+  <circle id="q4" r="8" fill="#7CFC00" visibility="hidden"/>
+</svg>
+
+<script>
+const QCELLS = $("qcells");
+for (let i = 0; i < 4; i++) {
+  const r = document.createElementNS("http://www.w3.org/2000/svg","rect");
+  r.setAttribute("class","cell");
+  r.setAttribute("x", 315 + i*42);
+  r.setAttribute("y", 170);
+  r.setAttribute("width", 36);
+  r.setAttribute("height", 24);
+  r.setAttribute("rx", 4);
+  QCELLS.appendChild(r);
+}
+const qcellEls = [...QCELLS.children];
+
+const Q = {
+  btnA:[140,95], btnB:[140,185], queue:[400,182], wl:[670,125],
+  ex:[670,265], sp2:[895,185], hd:[670,400], bg:[150,400]
+};
+
+function move2(dot, from, to, t0, t1, now) {
+  if (now < t0 || now > t1) { dot.setAttribute("visibility","hidden"); return; }
+  const k = (now - t0) / (t1 - t0);
+  dot.setAttribute("cx", from[0] + (to[0]-from[0]) * k);
+  dot.setAttribute("cy", from[1] + (to[1]-from[1]) * k);
+  dot.setAttribute("visibility","visible");
+}
+function setActive2(id, on) { $(id).classList.toggle("active", on); }
+function fillQ(n) { qcellEls.forEach((c,i)=>c.classList.toggle("on", i<n)); }
+
+const LOOP2 = 14000;
+const T02 = performance.now();
+
+const steps2 = [
+  [0,    "① 按钮A：new wr1{Completed=信号C1} → writeQueue.Enqueue(wr1) → 立即返回'已提交'"],
+  [1500, "② 按钮B：new wr2{Completed=信号C2} → writeQueue.Enqueue(wr2) → 立即返回（不阻塞）"],
+  [3000, "③ 后台线程A/B 各自 wr.Completed.Wait（闭包捕获自己的 wr，互不干扰）"],
+  [4500, "④ WriteLoop：TryDequeue 取出 wr1 → ExecuteWrite(wr1) → activeWrite=wr1"],
+  [5500, "⑤ ExecuteWrite：lock(io) sp.Write(wr1.Frame) → wr1.Ack.WaitOne 等回显"],
+  [7000, "⑥ Handle 收到 0x05 回显 → 比对 activeWrite.Frame → aw.AckOk=true → aw.Ack.Set()"],
+  [8000, "⑦ ExecuteWrite 被唤醒 → wr1.Result=true → wr1.Completed.Set() → 唤醒后台线程A"],
+  [9500, "⑧ WriteLoop 取 wr2 → ExecuteWrite(wr2) → activeWrite=wr2（串行，不会与wr1冲突）"],
+  [11000,"⑨ wr2 完成 → wr2.Completed.Set() → 唤醒后台线程B（各等各的，不会错配）"],
+  [12500,"—— 多按钮并发提交、串行执行、独立回传完成 ——"]
+];
+
+function frame2() {
+  const now = (performance.now() - T02) % LOOP2;
+  let label = "";
+  for (const [t, s] of steps2) if (now >= t) label = s;
+  $("step2").textContent = label;
+
+  setActive2("bQ", now >= 0 && now < 4500);
+  setActive2("bWl", now >= 4500 && now < 12500);
+  setActive2("bEx", now >= 5000 && now < 9000 || now >= 9500 && now < 12000);
+  setActive2("bSp2", now >= 5500 && now < 7000 || now >= 10000 && now < 11500);
+  setActive2("bHd", now >= 6500 && now < 8000 || now >= 11000 && now < 12000);
+  setActive2("bBg", now >= 3000 && now < 12500);
+
+  fillQ(now < 1500 ? 0 : now < 3000 ? 1 : now < 9500 ? 2 : now < 11000 ? 1 : 0);
+
+  // ① 按钮A → 队列
+  move2($("q0"), Q.btnA, Q.queue, 200, 1400, now);
+  // ② 按钮B → 队列
+  move2($("q1"), Q.btnB, Q.queue, 1700, 2900, now);
+  // ④ 队列 → WriteLoop
+  move2($("q2"), Q.queue, Q.wl, 4500, 5400, now);
+  // ⑤ WriteLoop → ExecuteWrite → 串口
+  move2($("q2"), Q.wl, Q.ex, 5500, 6500, now);
+  move2($("q3"), Q.ex, Q.sp2, 6500, 7500, now);
+  // ⑥ 串口 → Handle
+  move2($("q3"), Q.sp2, Q.hd, 7000, 7800, now);
+  // ⑦ Handle → ExecuteWrite(Ack.Set) → Completed → 后台线程
+  move2($("q4"), Q.hd, Q.ex, 8000, 8500, now);
+  move2($("q4"), Q.ex, Q.bg, 8500, 9400, now);
+  // ⑨ wr! wr2
+  move2($("q2"), Q.queue, Q.wl, 9500, 10000, now);
+  move2($("q3"), Q.wl, Q.ex, 10000, 10800, now);
+  move2($("q4"), Q.ex, Q.bg, 11000, 12000, now);
+
+  $("out3").textContent = now >= 8000 ? "[结果] 从站01 线圈0 ON 执行成功 ✓ (wr1.Completed 唤醒后台线程A)" : "";
+  $("out4").textContent = now >= 11000 ? "[结果] 从站02 线圈0 OFF 执行成功 ✓ (wr2.Completed 唤醒后台线程B)" : "";
+  $("out5").textContent = now >= 12500 ? "关键：每个 wr 独立 Completed 信号，A 完成只唤醒等 A 的，不会错配" : "";
+
+  requestAnimationFrame(frame2);
+}
+frame2();
+</script>
+</body>
+</html>

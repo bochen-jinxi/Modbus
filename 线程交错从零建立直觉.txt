@@ -1,0 +1,127 @@
+线程交错从零建立直觉
+====================
+
+一、你的困惑
+"多线程程序线程交错太陌生"——因为单线程代码一行行往下走很直观，
+多线程却像"多个人同时翻同一本账本，随时可能被拉开"。
+本文用本项目的真实例子，帮你把"交错"从抽象变具体。
+
+
+二、交错到底是什么
+单核 CPU：同一时刻只跑一个线程，操作系统按时间片（约几ms~几十ms）
+轮流让各线程跑。时间片到了就切走别的线程，这叫"抢占"。
+多核 CPU：多个线程真同时在不同核上跑。
+
+关键：你写的"三行代码"不是"一口气跑完"的。
+每行之间都可能被切走，让别的线程插进来跑几行再切回来。
+"交错"就是：多个线程的代码行交替执行，顺序不确定。
+
+单线程：A1→A2→A3→A4→A5（一条线）
+两线程可能：A1→A2→B1→B2→A3→B3→A4→A5→B4（交错）
+也可能：A1→A2→A3→A4→A5→B1→B2→B3→B4（A先跑完）
+哪种都可能，不保证。
+
+
+三、为什么交错会出问题（三种典型）
+
+【1】读-改-写被插队
+  count++ 看着一行，实际三步：读count → 加1 → 写回。
+  线程A：读count=5
+  线程B：读count=5      ← 插进来了，A还没写回
+  线程A：写count=6
+  线程B：写count=6      ← 两次++结果只+1，丢了一次
+  这就是 i++ 不安全的原因，要用 Interlocked.Increment。
+
+【2】check-then-act 被插队
+  if (buf.Count < 10) buf.Add(x);
+  线程A：判断 Count=9 < 10，可以加
+  线程B：判断 Count=9 < 10，也加    ← 两个都通过了判断
+  线程A：Add → Count=10
+  线程B：Add → Count=11              ← 超过10了，判断失效
+  判断和动作之间被插队，判断结果就作废。要 lock 把判断+动作包成原子。
+
+【3】可见性：A写了，B读不到
+  线程A：running = false
+  线程B：while (running) ...         ← 可能一直看到旧的 true
+  因为 CPU 缓存/编译器优化，A写的值不一定立刻对B可见。
+  要 volatile 强制刷缓存可见。
+
+
+四、本项目真实交错点（三个）
+
+【交错点1：串口 sp】—— SendLoop 发数据 vs OnData 收数据
+  SendLoop:  lock(io){ sp.Write(...); }
+  OnData:    lock(io){ sp.Read(...); }
+  不加锁会怎样：两个同时调 sp 的底层方法，驱动状态错乱。
+  lock(io) 让 Write 和 Read 排队，同一时刻只有一个碰串口。
+
+【交错点2：缓冲区 buf】—— OnData 加数据 vs FrameGapLoop 切帧 vs WriteSingleCoil 清空
+  OnData:        lock(gate){ buf.AddRange(...); DrainInLock(); }
+  FrameGapLoop:  lock(gate){ DrainInLock(); }
+  WriteSingleCoil: lock(gate){ buf.Clear(); }
+  不加锁会怎样：AddRange 加到一半，Clear 把它清一半，List 内部结构损坏抛异常。
+  lock(gate) 让对 buf 的操作排队。
+
+【交错点3：信号 writeDone】—— WriteSingleCoil 等 vs Handle 设置
+  WriteSingleCoil: writeDone.Reset(); ... writeDone.WaitOne();
+  Handle:          writeDone.Set();
+  这个不用外部锁：AutoResetEvent 是内核原语，Set/Reset/WaitOne 自己内部有锁。
+  但有"逻辑竞态"（Reset后Write前旧应答Set），上一轮分析过，窗口极小可接受。
+
+
+五、怎么分析一段多线程代码（四步法）
+
+第1步：找共享状态——哪些变量/对象被多个线程碰？
+  本项目：sp、buf、lastDataTicks、running、writeSlave、writeOk、writeDone、frameReceived
+
+第2步：每个共享状态，谁读谁写？
+  buf：OnData写、FrameGapLoop读写、WriteSingleCoil写、SendLoop写 → 要 lock(gate)
+  sp：SendLoop/OnData/WriteSingleCoil 都用 → 要 lock(io)
+  lastDataTicks：OnData写、FrameGapLoop读 → Interlocked
+  running：主线程写、其他读 → volatile
+  writeDone：WriteSingleCoil等、Handle设 → 内核原语不用锁
+
+第3步：每个操作是单步还是复合？
+  buf.AddRange+DrainInLock：复合 → 同一个 lock(gate) 包住
+  sp.Write：单步但 SerialPort 不线程安全 → lock(io)
+  writeDone.Set：单步且内核安全 → 不用锁
+
+第4步：列危险交错顺序，看防御是否覆盖
+  例：OnData加数据后、切帧前，WriteSingleCoil的Clear插进来？
+  → 合并 AddRange+DrainInLock 到同一锁，已修复。
+
+
+六、建立直觉的练习
+1. 读代码时，先假设"单线程"，理解逻辑。
+2. 再问：哪些变量多线程碰？标出来。
+3. 对每个标出的变量，想象"另一个线程在我这两行之间插了一脚"，
+   结果还对吗？不对就要 lock/Interlocked/volatile。
+4. 画时序图：两条竖线代表两线程，横箭头标操作，上下错开看交错。
+5. 记住：lock 保证"被包住的几行一口气跑完，中间不切走"。
+   所以复合操作要 lock，单步原子操作可能不用。
+
+
+七、lock 到底干了什么
+  lock(obj) { 代码 }
+  = 拿 obj 的锁 → 跑代码 → 还锁。
+  同一时刻只有一个线程能拿住 obj 的锁，其他要 lock(obj) 的线程阻塞等。
+  效果：被包的代码块对其他拿同把锁的线程来说"一口气跑完"。
+  注意：只对"也 lock 同一个 obj"的线程有效。不 lock 的线程照样插进来。
+  所以所有访问 buf 的地方都要 lock(gate)，漏一个就破防。
+
+
+八、口诀
+交错就是随时切，行间能插别的线程；
+读改写、查后做，插一脚就出错。
+共享状态先标出，谁读谁写列清楚；
+复合多步用 lock，单步原子看类型。
+List 串口要加锁，Event 信号不用包；
+volatile 管可见，Interlocked 管加减。
+分析四步走一遍：找共享、分读写、看单复合、列交错。
+
+
+九、一句话总结
+多线程难就难在"执行顺序不确定"。
+你写的是 A1→A2→A3，实际可能是 A1→B1→A2→B2→A3，
+只要 A1/A2/A3 之间有共享状态被 B 改，就可能错。
+锁的作用：把怕插队的几行"焊死"成一坨，中间不让切走。

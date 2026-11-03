@@ -1,0 +1,93 @@
+writeDone 的 Set/Reset 无锁保护分析
+====================================
+
+一、问题
+writeDone 是 AutoResetEvent，WriteSingleCoil 里 Reset/WaitOne，
+Handle 里 Set，没有外部锁保护。线程交错会不会有逻辑问题？
+
+
+二、AutoResetEvent 本身是线程安全的
+Set / Reset / WaitOne 是 .NET 内核级同步原语，内部有内核锁，
+单个操作不会数据损坏、不会崩。不需要外部 lock 包裹。
+这点和 buf（List<byte>）不同——buf 的 AddRange/Clear 不是线程安全，
+必须 lock(gate)。writeDone 不需要。
+
+
+三、但"线程安全" ≠ "无逻辑竞态"
+操作不损坏，不代表交错时语义正确。分析三个操作：
+  W(写线程): Reset → Write → WaitOne
+  R(接收线程): Handle → writeOk=... → Set
+
+场景A 正常成功：
+  W: Reset → Write → WaitOne(等)
+  R: 收到新应答 → writeOk=true → Set
+  W: WaitOne 返回 true → 读 writeOk=true → 成功
+  正确。
+
+场景B 超时后迟到：
+  W: Reset → Write → WaitOne 超时 false
+  R: 迟到应答 → Set（信号残留）
+  W: 下一轮 Reset 清掉残留
+  正确（上一轮已详析）。
+
+场景C Reset 后、Write 前 R 插入 Set：
+  W: Reset（清信号）
+  R: 旧应答到达 → Handle → writeOk=旧值 → Set  ← 信号又置位
+  W: Write(新请求) → WaitOne 立即返回 true（拿到 R 的旧 Set）
+  W: 读 writeOk=旧值
+  ★ 若旧应答是成功回显(writeOk=true) → 误判新请求成功
+  ★ 若旧应答是异常响应(writeOk=false) → 继续重试，无害
+
+
+四、场景C 的危害与概率
+危害：旧的成功回显被误当成新请求的成功（实际新请求刚发，从站还没处理）。
+概率：极低，需同时满足：
+  1. 上一轮超时（旧应答迟到 >50ms）
+  2. 旧应答恰在下一轮 Reset 之后、Write 之前到达（窗口微秒级）
+  3. 旧应答是成功回显（writeOk=true）
+  4. 从站号一致（同从站重试，从站校验挡不住）
+  5. CRC 正确（完整旧帧，CRC 挡不住）
+工程环境近乎零。
+
+
+五、能否彻底消除
+要彻底消除场景C，需区分"哪个 Set 是哪个请求的"——即事务ID匹配。
+但 Modbus RTU 帧无事务ID（不像 Modbus TCP 有 TID），无法关联。
+替代方案：
+  - Write 后再 Reset 一次再 WaitOne：但新应答若极快到达会被误清，更差。
+  - 加请求序号，Handle 里比对：改动大，且 RTU 无原生字段承载。
+代价大于收益，不值得。
+
+
+六、现有防御链对场景C 的压缩
+  DiscardInBuffer：清驱动缓冲里已到的旧应答字节
+  buf.Clear：清应用缓冲里已攒的旧帧
+  Reset：清信号位
+  从站校验：旧应答从站号不匹配则忽略（同从站重试时挡不住）
+  CRC 校验：残帧丢弃（完整旧帧挡不住）
+场景C 是"所有防御都挡不住的完整旧成功帧恰在微秒窗口到达"，残余风险。
+
+
+七、结论：不改代码
+1. AutoResetEvent 的 Set/Reset/WaitOne 本身线程安全，无需外部锁，不会数据损坏。
+2. 存在场景C 的极小逻辑竞态窗口，但：
+   - 窗口微秒级、概率近乎零
+   - 需旧应答迟到超一轮且恰在 Reset-Write 间到达且是成功回显
+   - Modbus RTU 无事务ID，彻底消除代价大
+3. 现有 DiscardInBuffer/buf.Clear/Reset/从站校验/CRC 多层防御已把风险压到工程可接受。
+4. 加锁保护 Set/Reset 也不能消除场景C（锁不改变"旧应答在窗口内到达"的时序事实）。
+所以：无锁不会数据损坏，逻辑竞态工程可接受，不改代码。
+
+
+八、口诀
+AutoReset 内核锁，Set/Reset 不用包；
+线程安全不损坏，但语义交错有缝隙。
+Reset 后 Write 前，旧应答恰来就误判；
+窗口微秒概率零，RTU 无 TID 难根除。
+多层防御压风险，加锁也挡不住时序，不改代码最务实。
+
+
+九、涉及代码位置
+WriteSingleCoil: writeDone.Reset() / writeDone.WaitOne()  写线程
+Handle: writeOk=...; writeDone.Set()                      接收线程
+两者无外部锁，靠 AutoResetEvent 内核同步 + 防御链。

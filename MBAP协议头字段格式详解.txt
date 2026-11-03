@@ -1,0 +1,127 @@
+MBAP 协议头字段格式详解（Protocol ID 2字节+大端序）
+====================================================
+
+一、核心一段（先直接回答）
+对，Protocol ID 必须 2 字节，且高字节在前（大端序）。MBAP 头规范固定 7 字节 = TID(2) + ProtocolID(2) + Length(2) + UnitID(1)，每个字段长度固定不可变。Protocol ID 固定值 0x0000 表示 Modbus 协议（非 0 服务器会拒绝）。所有多字节字段都是大端序（Big-Endian，高字节先），因为 Modbus TCP 跑在 TCP 上，遵循网络字节序（Network Byte Order = 大端）。C# 在 x86 上是小端序，所以要手动 (value>>8) 取高字节放前面、(value&0xFF) 取低字节放后面。Protocol ID=0x0000 高低都是 0 看不出顺序，但规范要求大端放。
+
+二、MBAP 头完整结构（7字节固定）
+
+  偏移  长度  字段              | 值/说明
+  -----------------------------|----------------------------------
+  0     2     Transaction ID   | 客户端自增，请求响应配对
+  2     2     Protocol ID      | 固定 0x0000（Modbus协议）
+  4     2     Length            | 后续字节数 = UnitID(1) + PDU
+  6     1     Unit ID           | 从站地址（0~247）
+
+  固定7字节，不能多不能少。每个字段长度由规范定死，不可变。
+
+三、Protocol ID 为什么是 2 字节且固定 0x0000
+
+【为什么 2 字节】
+  MBAP = Modbus Application Protocol header
+  规范（Modbus Messaging on TCP/IP Implementation Guide v1.0b）定义：
+    Protocol Identifier: 2 bytes
+  字段长度固定，不可变。
+
+【为什么固定 0x0000】
+  0x0000 = Modbus 协议
+  Modbus 组织保留这个字段为 0，用于未来扩展：
+    - 如果将来有 Modbus over 其他协议，可能用不同 Protocol ID
+    - 目前只有 0x0000 合法
+  服务器收到非 0x0000 会拒绝（规范要求）
+
+【代码里怎么写】
+  req[2] = 0; req[3] = 0;   // Protocol ID = 0x0000（大端：高字节0放前，低字节0放后）
+  两个 0 看不出顺序，但规范要求大端放。
+
+四、为什么高字节在前（大端序）
+
+【大端序 vs 小端序】
+  值 0x1234（2字节）：
+    大端序（Big-Endian）：[0x12][0x34]  高字节在前
+    小端序（Little-Endian）：[0x34][0x12]  低字节在前
+
+  MBAP 头用大端序：高字节在前。
+  req[0] = (byte)(tid >> 8)   = 高字节（先放）
+  req[1] = (byte)(tid & 0xFF) = 低字节（后放）
+
+【为什么网络协议用大端序】
+  历史原因：TCP/IP 规范（RFC 1700）定义"网络字节序 = 大端序"。
+  所有网络协议跟随这个约定（TCP/UDP端口、IP地址、HTTP字段...）。
+  Modbus TCP 跑在 TCP 上，遵循网络字节序 = 大端。
+
+【C# 为什么要手动转】
+  C# 在 x86/x64 上是小端序（CPU 原生小端）。
+  ushort 0x1234 在内存里是小端：[0x34][0x12]
+  但 Modbus 要大端：[0x12][0x34]
+  所以不能直接 BitConverter.GetBytes（它按小端出），要手动拆：
+    (byte)(tid >> 8)   = 0x12（高字节）
+    (byte)(tid & 0xFF) = 0x34（低字节）
+    req[0]=0x12, req[1]=0x34 → 大端
+
+五、各字段的大端序示例
+
+  TID = 0x0005：
+    req[0] = (byte)(0x0005 >> 8)   = 0x00（高字节）
+    req[1] = (byte)(0x0005 & 0xFF) = 0x05（低字节）
+    → [0x00][0x05] 大端
+
+  Protocol ID = 0x0000：
+    req[2] = 0x00（高字节）
+    req[3] = 0x00（低字节）
+    → [0x00][0x00]（高低都是0，看不出来但规范要求大端放）
+
+  Length = 0x0006：
+    req[4] = 0x00（高字节）
+    req[5] = 0x06（低字节）
+    → [0x00][0x06] 大端
+
+  Unit ID = 0x01（1字节，没有字节序问题）：
+    req[6] = 0x01
+
+六、Modbus RTU vs TCP 的字节序
+
+  RTU：串口逐字节传，没有"字节序"概念（每个字段按规范顺序放）
+    帧里多字节字段也是"高字节先"（寄存器地址、寄存器值）
+    但 RTU 没有 MBAP 头，直接 [地址][FC][数据高][数据低][CRC]
+
+  TCP：MBAP 头明确大端序，PDU 里多字节字段也是大端
+    [TID高][TID低][Proto高][Proto低][Len高][Len低][UnitID][FC][数据高][数据低]
+    全部大端，统一。
+
+七、诚实补充（所有我知道的信息）
+
+1. Protocol ID 字段是 Modbus 组织的"预留扩展位"：
+   - 0x0000 = Modbus
+   - 其他值保留给未来协议（至今没用过）
+   - 服务器实现通常硬编码检查 == 0x0000，非 0 返回异常或断开
+
+2. 大端序也叫"网络字节序"，小端序叫"主机字节序"（x86）。
+   C/C++ 有 htonl/ntohl 转换，C# 没有内置，要手动拆或用 BinaryPrimitives。
+   BinaryPrimitives.WriteUInt16BigEndian(span, value) 是 .NET Core 2.1+ 的现代写法。
+
+3. Protocol ID = 0x0000 两个字节都是 0，所以 req[2]=0, req[3]=0
+   写成 req[2] = 0; req[3] = 0; 和 req[2] = (byte)(0 >> 8); req[3] = (byte)(0 & 0xFF); 一样
+   因为 0 的高字节和低字节都是 0，直接写 0 更简洁。
+
+4. Length 字段 = UnitID(1) + PDU长度
+   读2个寄存器请求：PDU = FC(1) + 起始(2) + 数量(2) = 5
+   Length = 1 + 5 = 6
+   req[4]=0, req[5]=6 → [0x00][0x06] 大端
+
+5. Unit ID 是 1 字节，没有字节序问题。
+   但它在 MBAP 头里的位置固定偏移6。
+   "Ignore Unit ID"勾选时服务器不校验这个字段，但客户端仍要发送（MBAP头必须有）。
+
+6. Modbus RTU 的多字节字段也是"高字节先"（大端）：
+   寄存器地址 0x0000 → [0x00][0x00]
+   寄存器值 0x0123 → [0x01][0x23]
+   CRC 是小端（低字节先）——这是 RTU 唯一的小端字段，因为 CRC 规范这么定。
+   TCP 没有 CRC，全部大端。
+
+八、记忆口诀
+
+「MBAP头7字节固定：TID2+Proto2+Len2+Unit1，Protocol ID固定0x0000；
+ 全部大端序高字节先（网络字节序），C#小端要手动>>8取高&0xFF取低；
+ Proto=0x0000高低都是0看不出顺序，但规范要求大端放；
+ RTU多字节也大端但CRC小端，TCP无CRC全大端」

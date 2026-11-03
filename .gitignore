@@ -1,0 +1,9 @@
+# Visual Studio 临时文件
+.vs/
+
+# 编译输出
+bin/
+obj/
+
+# CodeArts 工具临时目录
+.codeartsdoer/

@@ -1,0 +1,84 @@
+OnData 的 AddRange 与 buf.Clear 竞态分析
+=========================================
+
+一、问题
+OnData 里 buf.AddRange(tmp) 和 Drain() 是两个独立的 lock(gate) 块：
+  lock (gate) { buf.AddRange(tmp); count = buf.Count; }   ← 块1：数据进 buf
+  Console.WriteLine(...);                                   ← 间隙（不在锁内）
+  Interlocked.Exchange(...);                                ← 间隙
+  Drain();  → lock (gate) { DrainInLock(); }               ← 块2：切帧
+
+WriteSingleCoil / SendLoop 超时处理里有：
+  lock (gate) { buf.Clear(); }
+
+问：OnData 块1加完数据还没块2切帧时，buf.Clear 插入把数据清掉？
+
+
+二、会，这是真实竞态
+时序：
+  1. OnData 块1：lock(gate) buf.AddRange(tmp) → 释放 gate  ← 数据进 buf 了
+  2. WriteSingleCoil：lock(gate) buf.Clear() → 释放 gate   ← 清掉了！
+  3. OnData 块2：Drain() → lock(gate) DrainInLock → buf 空，切不出帧
+
+结果：OnData 读到的数据被清掉，没切帧，数据丢失。
+
+
+三、危害评估
+在 WriteSingleCoil 重试场景：buf.Clear 在 Write 之前，buf 里只可能是
+上一轮的迟到应答（旧数据）。清掉旧数据正是目的，无害。
+
+在 SendLoop 超时场景：buf.Clear 在判定超时后，清掉的是"还没处理完的应答"。
+但 SendLoop 已 WaitOne 超时（frameReceived 没 Set），逻辑上已放弃这次，
+清掉是"放弃"的体现。不过若应答其实到了、只是 OnData 还没 Drain，
+本该成功的应答被误清 → 误判超时。这是真实的数据丢失风险。
+
+
+四、根因
+AddRange 和 DrainInLock 分两个 lock(gate) 块，中间有非锁代码
+（Console.WriteLine、Interlocked.Exchange），buf.Clear 可在间隙插入。
+lock(gate) 只保证各自块内原子，不保证两块之间不被打断。
+
+
+五、修复：合并 AddRange + DrainInLock 到同一 lock(gate) 块
+改后 OnData：
+  lock (io) { 读 tmp }
+  List<byte[]> frames;
+  lock (gate)
+  {
+      buf.AddRange(tmp);
+      count = buf.Count;
+      frames = DrainInLock();      ← 同一锁内立即切帧
+  }
+  Console.WriteLine(...);
+  Interlocked.Exchange(...);
+  foreach (var f in frames) Handle(f);   ← Handle 在锁外
+
+效果：AddRange 和 DrainInLock 原子执行，buf.Clear 无法插入中间。
+  - buf.Clear 在 AddRange 前：清旧数据，tmp 还没进，无害。
+  - buf.Clear 在 DrainInLock 后：数据已切走成 frames，清的是剩余残帧，无害。
+不再出现"加了没切就被清"。
+
+
+六、为什么 Handle 放锁外
+Handle 里有 Console.WriteLine、CRC 计算、从站校验、Set 信号，耗时较长。
+放锁外避免长时间持 gate 锁，让 buf.Clear/其他 OnData 能及时拿锁。
+frames 是已切出的完整帧副本，离开锁后处理不影响 buf。
+
+
+七、Interlocked.Exchange 位置
+记录"最后收到数据时刻"给 FrameGapLoop 用。移到 lock(gate) 块后、Handle 前。
+与原位置（AddRange 后）差几微秒，对 3.5 字符判帧无影响。
+
+
+八、口诀
+加数据和切帧要同锁，中间不留缝；
+缝里插进 buf.Clear，加了没切就白干。
+合并 AddRange 和 Drain，原子切帧才稳妥；
+Handle 拿着帧副本，锁外慢慢去处理。
+
+
+九、涉及代码位置
+Program.cs OnData 方法：
+  改前：lock(gate){AddRange} ... Drain(){lock(gate){DrainInLock}}  两块
+  改后：lock(gate){AddRange; DrainInLock} 一块，Handle 移锁外
+Drain() 方法不再被 OnData 调用（保留备用）。

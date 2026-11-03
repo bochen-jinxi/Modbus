@@ -1,0 +1,76 @@
+running 的多线程写分析（修正"单一写线程"表述）
+================================================
+
+一、你的发现对了
+running = false 有 3 个写入点，分属 3 个线程：
+  1. 参数模式 Main：running = false（主线程）
+  2. Ctrl+C 回调：Console.CancelKeyPress += ... running = false（控制台事件线程，独立线程）
+  3. CmdLoop quit：running = false（CmdLoop 线程）
+
+所以 running 是多线程写，不符合之前说的"单一写线程"。
+之前文档的表述对 running 不精确，在此修正。
+
+
+二、但 running 用 volatile 仍然安全，原因：同值单向写
+  1. 所有写都是 false（同一个值）。
+  2. 初始 true，之后只写 false，从不写回 true（单向 true→false）。
+  3. 每次写是单步赋值（running = false），不是 RMW（不是 running++）。
+
+多线程都写 false：
+  线程A写 false，线程B写 false，结果还是 false。
+  没有"丢写"（写的不一样会丢一个），没有"竞争"（都写同值不冲突）。
+  volatile 保证每次写立刻对读线程可见，while(running) 能及时看到 false 退出。
+
+
+三、什么情况下多线程写 volatile 会不安全
+  1. 多线程写不同值：
+     线程A写 true，线程B写 false，交错时读线程可能看到翻转，且
+     "最后谁写的"不确定。要 lock 或 Interlocked 协调。
+  2. RMW（读改写）：
+     多线程 running++ 或 running &= flag，volatile 不保证原子，要 Interlocked。
+  3. 来回切换（非单调）：
+     有线程写 true 又有线程写 false 反复切，volatile 可见性够但语义可能乱。
+
+running 不踩任何一条：都写 false、单步赋值、单向。所以 volatile 够。
+
+
+四、修正后的 volatile 适用场景分类
+  场景A：单一写线程（写几次都行）→ volatile 安全
+    本项目：writeOk（接收线程写）、writeSlave（写线程写）、curWriteFrame（写线程写）
+
+  场景B：多线程写同一个值 + 单步赋值 + 单调 → volatile 安全
+    本项目：running（多线程都写 false，true→false 单向）★ 本题
+
+  场景C：多线程写不同值 / RMW / 非单调 → volatile 不够
+    要 Interlocked（RMW）或 lock（复合/不同值协调）
+    本项目无此场景
+
+
+五、为什么 Ctrl+C 回调是独立线程
+Console.CancelKeyPress 的事件回调不在主线程执行，
+.NET 用一个专门的控制台信号处理线程跑回调。
+所以 Ctrl+C 写 running 和主线程、CmdLoop 是不同线程。
+回调里 e.Cancel=true 阻止默认终止，让程序自己 running=false 优雅退出。
+
+
+六、口诀
+running 多线程写，但都写 false 同一个值；
+单向 true 变 false，不回 true 不竞争。
+volatile 够用因为：同值+单步+单调；
+若有人写 true 有人写 false，volatile 就不够。
+单写线程最省心，多写同值单向也行；
+不同值或读改写，Interlocked 和 lock 上。
+
+
+七、修正之前文档
+  原表述："running 单一写线程（主线程），符合 volatile"
+  修正为："running 多线程写（主线程/Ctrl+C回调/CmdLoop），但都写 false、
+           单步赋值、单向 true→false，volatile 仍安全"
+  writeOk/writeSlave/curWriteFrame 仍是单一写线程，原表述不变。
+
+
+八、涉及代码位置
+  Line 105:  running = false  （参数模式 Main，主线程）
+  Line 117:  running = false  （Ctrl+C 回调，控制台事件线程）
+  Line 526:  running = false  （CmdLoop quit，CmdLoop 线程）
+  读：SendLoop/FrameGapLoop/CmdLoop 的 while(running)

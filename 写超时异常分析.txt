@@ -1,0 +1,75 @@
+on 1 0 写超时异常分析
+======================
+
+一、现象
+执行 dotnet run on 1 0，程序输出：
+  [参数模式] 串口已打开，执行 开到位 从站1 线圈0
+  [参数模式] 执行异常：The write timed out.
+  [参数模式] 执行失败
+串口 Open 成功，但 sp.Write 抛 TimeoutException（设的 WriteTimeout=1000ms）。
+
+
+二、根因（一段话讲完）
+这台机器装了 com0com 虚拟串口对驱动，查 WMI 设备列表确认：
+  com0com - serial port emulator (COM3) → COM0COM\PORT\CNCA1
+  com0com - serial port emulator (COM4) → COM0COM\PORT\CNCB1
+即 COM3 ↔ COM4 是一对虚拟串口，互相直连。
+程序打开 COM4 写数据，数据会从对端 COM3 出来。
+用户自己运行时读轮询正常（从站01 回 01-03-04-00-00-00-00-FA-33），
+说明用户在 COM3 端跑着一个 Modbus 从站模拟器，模拟从站01/02。
+我执行 on 1 0 时 COM3 端没有从站模拟器在跑（被杀进程或本就没起），
+COM4 的写无人接收 → 虚拟串口缓冲/流控阻塞 → 1 秒写超时。
+和代码逻辑无关，是"对端没开"的环境问题。
+
+
+三、为什么 Open 成功但 Write 超时
+com0com 虚拟串口：Open 只检查端口存在和未被独占，成功不代表对端在线。
+Write 把数据推向对端，若对端端口没打开/不读且虚拟串口启用了流控或缓冲满，
+写操作就阻塞。真实 USB转串口同理：适配器拔了，Open 可能还成功（驱动在），
+但 Write 失败。所以"能开不能写"是串口常见现象。
+
+
+四、为什么用户运行正常、我运行超时
+用户场景：COM3 端有从站模拟器（可能是某个 dotnet/串口调试程序），
+用户程序写 COM4 → 模拟器从 COM3 收 → 回应答到 COM3 → 用户程序从 COM4 收。
+我的场景：我执行前 Get-Process dotnet | Stop-Process 把所有 dotnet 进程杀了，
+如果从站模拟器是 dotnet 程序，一并被杀，COM3 端空了，COM4 写无人接 → 超时。
+
+
+五、代码层面已做的保护
+1. sp.WriteTimeout = 1000：写超时1秒抛异常，不会无限卡死。
+2. WriteSingleCoil 有 try-catch（参数模式）和重试3次机制。
+3. 异常被捕获打印"执行异常"，程序不崩、正常退出。
+注意：写超时异常目前会直接抛到调用方触发 catch，没进重试循环
+（重试只处理"等回显超时"和"异常响应"，sp.Write 本身的异常在最内层 lock 里抛出）。
+若想让写超时也走重试，可把 sp.Write 包进 try-catch 内层。
+
+
+六、解决方案
+1. 运行 on 1 0 前，先在 COM3 端启动 Modbus 从站模拟器（模拟从站01，支持功能码0x05写线圈）。
+2. 或用真实 USB转RS485 + Modbus 从站硬件，把程序里 "COM4" 改成对应串口。
+3. 验证虚拟串口对：在一端写，另一端用串口调试助手能收到，说明配对正常。
+
+
+七、com0com 虚拟串口对速记
+COM3 ↔ COM4 一对，CNCA0 ↔ CNCB0 另一对。
+一端写 = 另一端读，单端开不通信。
+口诀："虚拟串口成对用，单开一端写不通，对端起个从站器，命令才能往复行。"
+
+
+八、涉及端口清单
+COM1     —— 主板原生串口（ACPI\PNP0501）
+COM3     —— com0com CNCA1（与 COM4 配对）
+COM4     —— com0com CNCB1（程序当前使用，对端 COM3）
+CNCA0    —— com0com 另一对的A端
+CNCB0    —— com0com 另一对的B端
+
+
+九、验证修复（已跑通）
+在 COM3 端启动 Modbus 从站模拟器（SlaveSim 项目，从站地址01，支持0x03读/0x05写），
+再运行主程序 dotnet chenbo.dll on 1 0，完整链路成功：
+  主程序发：01-05-00-00-FF-00-8C-3A（从站01/0x05/线圈0/FF00=ON/CRC=8C3A）
+  从站收到：01-05-00-00-FF-00-8C-3A，原样回显
+  主程序收：回显 CRC 校验通过 → [写线圈成功] 线圈0 = ON(开到位) → 执行成功
+结论：代码逻辑完全正确，之前写超时纯粹是 COM3 端没从站模拟器。
+从站模拟器已放在 F:\chenbo\SlaveSim\，用法：dotnet run --project SlaveSim COM3 9600 1

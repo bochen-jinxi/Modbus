@@ -1,0 +1,85 @@
+DiscardInBuffer 与 OnData 竞态分析
+==================================
+
+一、问题
+WriteSingleCoil 重试循环里：
+  lock (io) { if (sp.IsOpen) sp.DiscardInBuffer(); }
+OnData 里：
+  lock (io) { int n = sp.BytesToRead; ... sp.Read(tmp, 0, n); }
+两者都 lock(io)，是否存在竞态？
+
+
+二、结论先行
+有竞态窗口，但当前 DiscardInBuffer → buf.Clear → Reset → Write 的顺序是
+刻意设计的防御链，残留窗口被 CRC + 从站校验兜底，不会产生错误结果。
+反过来合并锁块会更危险。
+
+
+三、lock(io) 提供的是互斥，不是无竞态
+DiscardInBuffer 和 OnData 的 sp.Read 不会同时执行（互斥）。
+但 DiscardInBuffer 和 sp.Write 是两个独立的 lock(io) 块，中间有间隙：
+
+  lock (io) { sp.DiscardInBuffer(); }   ← 释放 io 锁
+  lock (gate) { buf.Clear(); }           ← 这段 OnData 可以插入
+  writeDone.Reset();
+  lock (io) { sp.Write(...); }           ← 重新拿 io 锁
+
+
+四、竞态窗口
+DiscardInBuffer 释放 io 锁后、Write 重新拿锁前，OnData 可以插入：
+  lock(io) → sp.Read 读到刚到的旧应答字节 → 加到 buf → Drain()
+
+
+五、为什么不会出错（防御链逐层化解）
+1. DiscardInBuffer 在前：先清驱动缓冲里已到的旧数据。
+2. buf.Clear 紧随其后：清掉 OnData 在间隙里刚加进 buf 的旧数据。
+3. writeDone.Reset()：清掉旧应答可能已 Set 的信号。
+4. Write 之后 OnData 读到的是新请求的应答，正确。
+
+每一步清一种"旧痕迹"：驱动缓冲 → 应用缓冲 → 信号位，全覆盖。
+
+
+六、唯一残留窗口
+buf.Clear 之后、Write 之前，OnData 读到迟到应答的残帧加到 buf
+（不会被 buf.Clear 清，因为 Clear 已过）。
+但这残帧进 Handle 后被两道关卡过滤：
+  - CRC 校验：残帧 CRC 几乎必错，丢弃并滑动1字节对齐。
+  - 从站校验：writeSlave 不匹配则忽略。
+不影响新请求。
+
+
+七、反过来合并锁块为什么更差
+设想：
+  lock (gate) { buf.Clear(); }
+  lock (io) { sp.DiscardInBuffer(); sp.Write(...); }   ← DiscardInBuffer 和 Write 同锁
+
+看似消除了间隙，但 buf.Clear 在 DiscardInBuffer 之前：
+OnData 在 buf.Clear 后插入读旧数据加到 buf，不会被任何 Clear 清掉，
+直接污染新请求数据。比当前更危险。
+
+原因：buf.Clear 必须在 DiscardInBuffer 之后，才能清掉"DiscardInBuffer
+释放锁到 buf.Clear 之间 OnData 插入读到的旧数据"。顺序不能反。
+
+
+八、锁顺序约束
+当前锁顺序 io→gate（与 OnData 一致），不能在 lock(io) 内 lock(gate)。
+所以 DiscardInBuffer（要 io）和 buf.Clear（要 gate）必须分两个块，
+无法合并成一个原子操作。间隙是锁顺序的必然代价，靠防御链化解。
+
+
+九、口诀
+先清驱动再清帧，信号复位再发送；
+中间插入的旧数据，被 Clear 扫掉；
+Clear 后插入的残帧，被 CRC 和从站号挡掉。
+锁顺序 io→gate 不能反，间隙靠防御链兜底。
+
+
+十、涉及代码位置
+Program.cs WriteSingleCoil 重试循环内：
+  lock (io) { sp.DiscardInBuffer(); }   清驱动缓冲
+  lock (gate) { buf.Clear(); }          清应用缓冲
+  writeDone.Reset();                    清信号
+  lock (io) { sp.Write(...); }          发送
+OnData 内：
+  lock (io) { sp.BytesToRead; sp.Read; } 读驱动缓冲
+两者 lock(io) 互斥，间隙靠上述防御链化解。

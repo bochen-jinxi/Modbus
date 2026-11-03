@@ -1,0 +1,140 @@
+==================================================
+任务：参照 dataflow，使用 gen_video.py 生成视频
+执行时间：2026-11-03
+结果：成功生成 dataflow.mp4 + dataflow.gif
+==================================================
+
+一、任务理解
+--------------------------------------------------
+用户要求："把整个过程参照这个 dataflow，使用 gen_video.py 生成视频"。
+
+涉及的三个文件（均在 F:\chenbo\）：
+  - gen_video.py        生成脚本（Python，用 PIL 画帧 + imageio 编码）
+  - dataflow.html       网页版动画（已存在，本次未改动）
+  - dataflow.mp4 / .gif 视频产物（本次重新生成）
+
+"整个过程"指 Program.cs 里 Modbus RTU 多线程程序的完整运行流程：
+  - 读流程（0~12s）：SendLoop 发请求 → OnData 收应答 → FrameGapLoop 判帧尾
+    → Drain 切帧 → Handle 解析 → frameReceived.Set() 唤醒 SendLoop → 轮询下一从站
+  - 写流程（12~24s）：多按钮并发提交 writeQueue → WriteLoop 串行消费
+    → ExecuteWrite 发帧等回显 → Handle 比对 activeWrite → Ack.Set → Completed.Set
+    → 唤醒各自的后台打印线程
+
+二、环境检查
+--------------------------------------------------
+Python 启动器：py（系统 python 命令不可用，用 py 启动器成功）
+依赖版本：
+  - PIL (Pillow) 12.3.0
+  - numpy 2.3.0
+  - imageio 2.38.1
+mp4 写入测试：用 libx264 编码写一帧测试通过（imageio 自带 ffmpeg 后端）。
+字体：C:/Windows/Fonts/msyh.ttc（微软雅黑，用于中文渲染）。
+
+三、执行过程
+--------------------------------------------------
+命令：cd /f/chenbo && py gen_video.py
+脚本参数（写死在 gen_video.py 第 9 行）：
+  W, H = 1280, 1100   画面尺寸
+  FPS  = 15           帧率
+  SEC  = 24           总时长 24 秒
+  N    = FPS * SEC = 360 帧
+
+渲染进度（脚本每 30 帧打印一次）：
+  frame 0/360 → frame 330/360 → DONE
+  全程无报错、无丢帧。
+
+四、产物
+--------------------------------------------------
+1) F:\chenbo\dataflow.mp4
+   大小：850,693 字节（约 831 KB）
+   编码：H.264 (libx264)
+   时长：24 秒 @ 15fps
+   分辨率：1280×1100
+
+2) F:\chenbo\dataflow.gif
+   大小：4,132,926 字节（约 3.94 MB）
+   时长：24 秒（脚本里 i%2==0 抽帧，gif 帧率减半约 7.5fps，duration=2/FPS）
+   分辨率：960×825（脚本里 resize 到 3/4）
+   loop=0 无限循环
+
+五、视频内容结构（参照 gen_video.py 源码）
+--------------------------------------------------
+【第一段：读流程 t=0~12s】make_frame → draw_* 系列函数
+  画面布局：
+    顶部：步骤标题（STEPS 数组，8 步）
+    中部上：4 条线程跑道（Main / SendLoop / OnData / FrameGapLoop）
+      - run 模式：彩色圆点从左往右移动
+      - wait 模式：跑道变红底 + "阻塞中…" 闪烁
+      - idle 模式：灰色静止
+    中部中：共享内存区 6 个格子
+      sp[lock(io)] / buf[lock(gate)] / curSlave[volatile] /
+      running[volatile] / lastDataTicks[Interlocked] / frameReceived[AutoResetEvent]
+      每个格子带锁图标，锁的颜色 = 当前持锁线程颜色
+    中部下：帧间静默进度条（3.5 字符=3.65ms）+ 解析输出
+    底部：电影式字幕（SUBS 数组，14 句解说词，随时间切换）
+
+  关键时间点（参照 SUBS / STEPS）：
+    t=0.0  SendLoop 写 curSlave=0x01
+    t=0.4  持 io 锁发请求帧
+    t=1.4  SendLoop 阻塞等 frameReceived（跑道变红）
+    t=1.6  OnData 持 io 锁读应答（分 3 批）
+    t=3.1  OnData 持 gate 锁入 buf + Interlocked 写 lastDataTicks
+    t=4.8  FrameGapLoop 判静默≥3.65ms → 持 gate 锁处理残帧
+    t=5.5  迟到字节想进 buf，gate 锁被占，OnData 等待（演示锁竞争）
+    t=6.2  Drain 切走 9 字节完整帧
+    t=7.6  Handle 校验 CRC + 比对 curSlave → 解析温湿度 25.3℃/60.5%RH
+    t=8.3  frameReceived.Set() 灯变绿
+    t=9.0  SendLoop 唤醒，idx→0x02 发下一帧
+    t=10.6 一轮完成，循环
+
+【第二段：写流程 t=12~24s】draw_write_frame
+  画面布局类似，但线程跑道换成：
+    按钮A/B (CmdLoop) / WriteLoop / ExecuteWrite / 后台打印线程
+  共享内存区换成：
+    writeQueue[ConcurrentQueue] / activeWrite[volatile] / sp[lock(io)] /
+    wr1.Completed / wr2.Completed / wr.Ack
+
+  关键时间点（参照 SUBS_W / STEPS_W）：
+    t=0    按钮A new wr1 → Enqueue → 立即返回"已提交"
+    t=1.5  按钮B new wr2 → Enqueue → 立即返回（不阻塞）
+    t=3.0  后台线程A/B 各自 wr.Completed.Wait（闭包捕获自己的 wr）
+    t=4.5  WriteLoop TryDequeue wr1 → ExecuteWrite(wr1) → activeWrite=wr1
+    t=5.5  sp.Write(wr1.Frame) → wr1.Ack.WaitOne 等回显
+    t=7.0  Handle 比对 activeWrite.Frame 整帧一致 → AckOk=true → Ack.Set()
+    t=8.0  wr1.Result=true → wr1.Completed.Set() → 唤醒后台线程A
+    t=9.5  WriteLoop 取 wr2 串行执行（不会与 wr1 冲突）
+    t=11.0 wr2.Completed.Set() → 唤醒后台线程B
+    t=12.5 完成
+
+  核心演示点：多按钮并发提交、WriteLoop 串行执行、每个 wr 独立 Completed
+  信号互不干扰、activeWrite 防止回显错配。
+
+六、视频里常驻的"诚实补充"BUG 警告
+--------------------------------------------------
+gen_video.py 第 258 行在画面上常驻一条红色警告：
+  "⚠ 诚实补充·源码两处BUG：189行 lock(gate) 内 Sleep(50000) → 持锁卡死50秒；
+   166行整数除法 → 帧超时永不触发（详见 运行流程分析.txt）"
+
+这是脚本作者（缴完学费的诚实补充）在视频里主动标注的源码历史 BUG，
+和本次生成任务无关，但说明这个视频是"带诚实警告的演示动画"，
+不是粉饰过的演示。本次生成保留了这条警告（脚本原样运行，未改）。
+
+七、本次未改动的内容
+--------------------------------------------------
+- gen_video.py：原样运行，未修改任何代码
+- dataflow.html：未触碰
+- Program.cs：未触碰
+- 之前生成的几个分析 txt：未触碰
+
+八、最终结论
+--------------------------------------------------
+任务完成。参照 dataflow 设计的 gen_video.py 已成功运行，
+生成两个视频文件：
+  - F:\chenbo\dataflow.mp4 (831 KB, 24s, 1280×1100, H264)
+  - F:\chenbo\dataflow.gif (3.94 MB, 24s, 960×825, 循环)
+视频完整覆盖 Program.cs 的读流程（SendLoop/OnData/FrameGapLoop 协调）
+和写流程（多按钮队列+独立信号异步通信），共 360 帧无报错。
+
+==================================================
+分析完毕
+==================================================

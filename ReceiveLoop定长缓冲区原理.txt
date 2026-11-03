@@ -1,0 +1,140 @@
+ReceiveLoop 定长 tmp[1024] 原理详解
+====================================
+
+一、核心一段（先直接回答）
+tmp[1024] 是每次 stream.Read 的"接收缓冲区"，定长 1024 是"单次读取上限"不是"总数据上限"。TCP 是流式，stream.Read(tmp,0,1024) 返回实际读到的字节数 n（0<n≤1024），只取前 n 字节入 buf。1024 是经验值：Modbus TCP 单帧最大约 260 字节（MBAP头7+PDU最大253），1024 够装好几帧。即使一次来超过 1024 字节，ReceiveLoop 循环 Read，buf 会攒全。tmp 在循环外分配一次复用，不每次 new，减少 GC 压力。定长是因为 TCP Read 本来就要预给缓冲区，不能"读任意长度"，必须指定最大容量。
+
+二、stream.Read 的工作原理
+
+【API 签名】int Read(byte[] buffer, int offset, int count)
+  buffer = 接收缓冲区（预分配）
+  offset = 从 buffer 哪个位置开始写
+  count = 最多读多少字节
+  返回值 n = 实际读到的字节数（0 < n <= count）
+
+【实际行为】
+  byte[] tmp = new byte[1024];   // 预分配1024字节"容器"
+  int n = stream.Read(tmp, 0, 1024);  // 最多读1024，实际读n个
+  // tmp[0]~tmp[n-1] 是这次读到的数据
+  // tmp[n]~tmp[1023] 是上次残留的旧数据（不能要）
+  → 只取前 n 字节：Array.Copy(tmp, seg, n); buf.AddRange(seg);
+
+【为什么不能"读任意长度"】
+  TCP 是流式协议，没有"消息边界"概念。
+  你不知道当前有多少字节可读，必须给一个缓冲区让 OS 往里填。
+  OS 填多少返回多少（n），你按 n 取。
+  所以必须预分配一个"最大容量"的 buffer，定长。
+
+三、为什么定 1024（不是100/10000/动态）
+
+【Modbus TCP 单帧最大长度】
+  MBAP头 = 7字节（TID2+Proto2+Len2+Unit1）
+  PDU最大 = 256字节（FC1+数据255）
+  单帧最大 = 7 + 256 = 263 字节
+  实际读寄存器响应 = 7 + 1(FC) + 1(byteCount) + 4(2寄存器) = 13 字节
+
+【1024 够不够】
+  单帧最大263 < 1024 ✓ 一次Read能装一帧
+  一次Read可能来多帧（粘包）：2帧=526 < 1024 ✓
+  一次Read可能来半帧（拆包）：几字节 < 1024 ✓
+  即使来4帧=1052 > 1024，这次Read读1024，下次Read读剩余28，buf攒全 ✓
+
+【为什么不用更大（如8192）】
+  能用但没必要：Modbus帧小，1024够装几帧
+  更大占内存多（每个ReceiveLoop多几KB），收益边际
+
+【为什么不用更小（如100）】
+  能用但效率低：单帧263 > 100，一帧要多次Read
+  更多次Read = 更多系统调用 = 更多开销
+  1024平衡了内存和系统调用次数
+
+【为什么不用动态/每次new】
+  tmp 在循环外分配一次，循环内复用同一个数组：
+    byte[] tmp = new byte[1024];  // 循环外一次
+    while (running) {
+        int n = stream.Read(tmp, 0, 1024);  // 复用tmp
+        ...
+    }
+  如果每次循环 new byte[1024]：
+    - 每次分配1024字节 → GC回收 → 再分配 → GC压力
+    - 复用同一个 tmp 不分配，零GC压力
+  所以定长+循环外分配是最优。
+
+四、tmp 复用的安全性
+
+【复用会不会读到旧数据】
+  tmp 每次被 stream.Read 覆盖前 n 字节，但 tmp[n]~tmp[1023] 是上次的旧数据。
+  代码只取前 n 字节：Array.Copy(tmp, seg, n); buf.AddRange(seg);
+  → 旧数据不被取，安全。
+
+【为什么先 Copy 再 AddRange】
+  buf.AddRange(tmp) 会把整个1024字节加进去（含旧数据）——错！
+  buf.AddRange 不能指定"只加前n个"（List<byte>没这个重载）。
+  所以先 Array.Copy(tmp, seg, n) 取前n字节到新数组seg，再 buf.AddRange(seg)。
+  seg 是每次 new 的 n 字节小数组，GC压力小（n通常几十字节）。
+
+【能不能避免每次new seg】
+  能，但复杂：用 buf.AddRange(tmp.AsSpan(0,n).ToArray()) 也要 ToArray。
+  或用 Span 直接操作 buf（要改 buf 类型）。
+  当前写法够简单，seg 几十字节的 GC 可忽略。
+
+五、各缓冲区大小对比
+
+缓冲区     | 大小   | 作用              | 为什么这个大小
+-----------|--------|-------------------|------------------
+tmp        | 1024   | 每次Read的容器     | 够装几帧，平衡内存和调用次数
+seg        | n(动态)| 每次实际读到的数据 | 只取前n字节，n由Read返回
+buf        | 动态   | 攒所有未处理字节   | List自动扩容，不限大小
+frame      | 动态   | 切出的一帧         | 按MBAP Length算，每帧不同
+
+tmp 是唯一"定长"的，因为它要预给 Read。其他都是按实际数据动态分配。
+
+六、和 RTU 版的对比
+
+  RTU：SerialPort.DataReceived 事件 → sp.BytesToRead 知道有多少字节 → 按精确字节数读
+    int n = sp.BytesToRead;        // 精确知道来多少
+    tmp = new byte[n];             // 按精确大小分配
+    sp.Read(tmp, 0, n);            // 读精确n个
+
+  TCP：没有"来多少字节"的预知 → 必须给一个最大容器 → Read返回实际n
+    byte[] tmp = new byte[1024];   // 给最大容器
+    int n = stream.Read(tmp,0,1024); // OS填多少返回n
+
+  区别：RTU能预知字节数（BytesToRead），TCP不能（流式），所以TCP要定长缓冲区。
+
+七、诚实补充（所有我知道的信息）
+
+1. 1024 是网络编程的经典缓冲区大小（1KB）：
+   - 不太小（减少Read调用次数）
+   - 不太大（省内存）
+   - 通常对齐页大小（4096）或缓存行（64），但1024够用
+
+2. stream.Read 是阻塞调用：
+   - 没数据时挂起等待（不像RTU的DataReceived事件触发）
+   - 有数据时返回（至少1字节）
+   - 返回0 = 对端关闭连接
+   - 抛异常 = 连接断开/错误
+   所以 ReceiveLoop 的 while(running) + Read 天然等待，不需要 Sleep/Poll
+
+3. NetworkStream.Read 不保证读满 count 字节：
+   - Read(tmp,0,1024) 可能只返回1字节（哪怕有更多数据）
+   - 这是TCP流式的正常行为，不是bug
+   - buf 攒帧 + Drain 按长度切，不依赖一次Read读多少
+
+4. 如果要用"精确大小"读TCP：
+   - 先读6字节（MBAP头）→ 解析Length → 再读Length字节（PDU）
+   - 但TCP流式，"读6字节"可能要多次Read才够（拆包）
+   - 还是要攒buf，不如统一"读最多1024 + buf攒 + 按长度切"简单
+
+5. tmp 可以用 ArrayPool<byte>.Shared.Rent(1024) 租用减少分配：
+   - 但本程序单线程接收，复用一个tmp已经零分配，用池过度设计
+
+6. 115200波特率下RTU一次交互1.5ms，TCP本地127.0.0.1延迟<1ms，
+   1024缓冲区对两者都绰绰有余（单帧才几十到260字节）。
+
+八、记忆口诀
+
+「tmp[1024]是Read的容器不是数据上限，Read返回实际n只取前n入buf；
+ TCP流式不能预知来多少必须给最大容器，RTU能BytesToRead按精确读；
+ 1024够装几帧（单帧最大263），不够循环Read攒buf；
+ 循环外分配复用零GC，只取前n字节旧数据不污染」

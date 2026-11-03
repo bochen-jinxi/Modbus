@@ -1,0 +1,103 @@
+如何判断哪些操作需要加锁、哪些是原子/线程安全
+================================================
+
+一、核心原则
+锁保护的是"共享可变状态的复合操作"，不是"原子操作"。
+判断三步：
+  1. 是否多线程访问？（单线程不用锁）
+  2. 是否共享可变状态？（只读常量不用锁）
+  3. 操作是否复合？（单步原子读写可能不用锁，多步复合要锁）
+
+
+二、原子操作 ≠ 线程安全，要分清
+  原子操作：操作不可分割，不会执行到一半被插队。
+  线程安全：多线程交错执行结果正确。
+  原子是线程安全的必要条件，但不够——还要"可见性"和"顺序性"。
+  例：int x=0; 线程A写 x=1; 线程B读 x。
+    读写是原子的（不会读到半个1），但B可能读到旧值0（可见性问题）→ 要 volatile。
+
+
+三、C#/.NET 各类操作的线程安全分级
+
+【1】单个读 / 单个写 —— 对齐的基本类型
+  int / uint / float / 引用类型 / 指针：对齐读写是原子的（ECMA-335 Partition I）。
+  long / double：32位进程上不保证原子（分两个32位写），64位上原子。
+  bool：原子（实际是1字节）。
+  byte / sbyte / short / ushort：原子。
+  但原子不保证可见性 → 跨线程要加 volatile 或用 Interlocked。
+  ★ 单读单写用 volatile 就够，不用 lock。
+
+【2】读-改-写（RMW）—— 不是原子！
+  i++ / i-- / x += 1 / x |= 1：读、改、写三步，可被插队。
+  要用 Interlocked.Increment / Interlocked.Add / Interlocked.Exchange / Interlocked.CompareExchange。
+  ★ 本项目 lastDataTicks 用 Interlocked.Exchange/Read，因为读写线程不同。
+
+【3】check-then-act —— 不是原子！
+  if (x == null) x = new ...;  判断和赋值两步，可双线程都进 if。
+  要 lock 或 Interlocked.CompareExchange。
+
+【4】复合多步操作 —— 要 lock
+  buf.AddRange(tmp); count = buf.Count;  多步 + List 不是线程安全 → lock(gate)。
+  任何"先检查再操作""多步改一个结构"都要 lock。
+
+【5】集合
+  List<T> / Dictionary<K,V> / HashSet<T>：不是线程安全，任何操作都要 lock。
+  ConcurrentDictionary / ConcurrentQueue / ConcurrentStack：本身线程安全，不用 lock。
+  但 ConcurrentXxx 的"多步复合"仍要外部协调（如先查再加）。
+
+【6】同步原语 —— 本身线程安全，不用外部锁
+  AutoResetEvent / ManualResetEvent / Semaphore / Mutex / Monitor：内核或用户态原语，
+  Set/Reset/WaitOne/Release 内部有锁，不用再包 lock。
+  ★ 本项目 writeDone(AutoResetEvent) 的 Set/Reset/WaitOne 不用外部锁。
+
+【7】volatile
+  保证可见性 + 对齐基本类型的原子性 + 禁止编译器/CPU重排。
+  适合"单写多读"的标志位。
+  ★ 本项目 running(volatile bool)、writeSlave(volatile byte)、writeOk(volatile bool)。
+  不能用于 RMW（i++ 仍不安全）。
+
+
+四、判断速查表
+  场景                          需要
+  单读/单写对齐基本类型跨线程   volatile（或 Interlocked）
+  i++ / x+=1 / RMW              Interlocked
+  check-then-act                lock 或 Interlocked.CompareExchange
+  List/Dictionary 任何操作      lock
+  ConcurrentXxx 单操作          不用（多步复合仍要协调）
+  AutoResetEvent.Set/Reset      不用（内核原语）
+  SerialPort.Write/Read         lock（不是线程安全，多线程共用要互斥）
+  多步改共享结构                lock
+
+
+五、本项目实例对照
+  buf (List<byte>)：AddRange/Clear/Count/DrainInLock 多步 → lock(gate)
+  sp (SerialPort)：Write/Read/DiscardInBuffer 多线程共用 → lock(io)
+  lastDataTicks (long)：跨线程读写 → Interlocked.Exchange/Read
+  running (volatile bool)：主线程写、其他线程读 → volatile
+  writeSlave/writeOk (volatile)：写线程写、接收线程写/读 → volatile
+  writeDone (AutoResetEvent)：Set/Reset/WaitOne → 不用外部锁
+  frameReceived (AutoResetEvent)：同上 → 不用外部锁
+
+
+六、怎么查一个类型是否线程安全
+  1. 查官方文档：MSDN 每个类都标注"This type is thread safe"或"not thread safe"。
+  2. 看类名：Concurrent 开头的是线程安全集合。
+  3. 同步原语（Event/Semaphore/Mutex/Interlocked/Volatile）文档明确说线程安全。
+  4. 其他默认不是线程安全（List/Dictionary/SerialPort 等）。
+
+
+七、口诀
+单读单写用 volatile，加减改写 Interlocked；
+check-then-act 要当心，多步复合上 lock。
+List 字典要加锁，Concurrent 开头不用管；
+Event 信号量原语，自己安全别再包。
+原子只管不撕裂，可见性还得 volatile；
+线程安全看文档，默认不安全要记牢。
+
+
+八、常见误区
+  误区1："int 读写是原子的所以多线程不用管" → 错，缺可见性，要 volatile。
+  误区2："给每个变量都加 lock 就安全" → 对但低效，且 lock 顺序不当会死锁。
+  误区3："AutoResetEvent.Set 要加锁" → 不用，内核原语本身安全。
+  误区4："volatile int i; i++ 安全" → 错，volatile 不保证 RMW 原子，要 Interlocked。
+  误区5："List 多线程只读不用锁" → 错，遍历时若另一线程写会抛 InvalidOperationException。

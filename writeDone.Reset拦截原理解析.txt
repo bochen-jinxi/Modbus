@@ -1,0 +1,81 @@
+writeDone.Reset() 拦截原理解析
+==============================
+
+一、问题
+WriteSingleCoil 的 for 循环每轮开头有 writeDone.Reset()，
+它拦截的是上次循环里的什么？
+
+
+二、writeDone 是 AutoResetEvent
+关键语义：
+  Set()      → 置位信号，释放一个正在 WaitOne 的等待者，然后自动复位。
+  WaitOne()  → 等信号；拿到后自动复位（消费掉这个信号）。
+  Reset()    → 手动复位（把信号强制清成未触发）。
+
+"自动复位"只在"信号被消费"时发生：
+  - WaitOne 拿到信号 → 自动复位（信号被消费）。
+  - Set 时有等待者 → 释放等待者并自动复位。
+  - Set 时没有等待者 → 信号留在 signaled 状态，不会被自动复位！
+
+
+三、拦截的具体场景
+第1轮 (attempt=1)：
+  writeDone.Reset()
+  sp.Write(请求1)
+  writeDone.WaitOne(50ms) → 从站没回 → 超时返回 false  ← 没消费任何信号
+  ...继续循环
+
+  此时从站的迟到应答到达：
+  OnData → Handle → writeDone.Set()  ← 信号置位，但没有等待者，留在 signaled 状态！
+
+第2轮 (attempt=2)：
+  writeDone.Reset()  ← ★ 拦截的就是这个迟到 Set 的残留！
+  sp.Write(请求2)
+  writeDone.WaitOne(50ms) → 等"请求2"的新应答
+
+如果没有第2轮的 Reset：
+  第2轮 WaitOne 会立即返回 true（拿到第1轮迟到应答的残留信号），
+  但此时请求2刚发，新应答还没到，writeOk 还是第1轮的旧值 →
+  误判成功/失败，逻辑错乱。
+
+
+四、所以 Reset 拦截的是什么
+不是"上轮的 WaitOne 调用"，而是：
+  上轮 WaitOne 超时（没消费信号）后，从站迟到应答触发 Handle→Set，
+  这个 Set 因无等待者而残留在 signaled 状态。
+  本轮 Reset 清掉它，确保本轮 WaitOne 只能等"本轮请求"的新应答。
+
+一句话：拦截"上一轮超时后迟到的、未被消费的 Set 残留"。
+
+
+五、如果上轮 WaitOne 成功了呢
+第1轮 WaitOne 拿到信号 → 自动复位（信号已消费）。
+之后即使 Handle 又 Set（间发），第2轮 Reset 也会清掉。
+所以无论上轮成功还是超时，本轮 Reset 都是无害且必要的兜底：
+  - 上轮成功：Reset 清掉"成功后间发的 Set"（冗余但无害）。
+  - 上轮超时：Reset 清掉"超时后迟到的 Set"（关键，防误判）。
+
+
+六、为什么 DiscardInBuffer + buf.Clear 还不够
+DiscardInBuffer 清驱动缓冲，buf.Clear 清应用缓冲，
+但 writeDone 是独立的信号量，不在这两个缓冲里。
+迟到应答可能已经走完 OnData→Handle→Set，信号已置位，
+DiscardInBuffer 和 buf.Clear 管不到它，必须 writeDone.Reset() 单独清。
+三样各管一段：驱动缓冲 / 应用缓冲 / 信号位，缺一不可。
+
+
+七、口诀
+AutoReset 会自动复位，但只复"被消费"的信号；
+WaitOne 超时没消费，之后 Set 就赖着不走。
+本轮开头 Reset 一下，把上轮迟到的残留清干净；
+三样清三段：驱动、缓冲、信号位，少清一样就漏旧。
+
+
+八、涉及代码位置
+Program.cs WriteSingleCoil for 循环内：
+  lock (io) { sp.DiscardInBuffer(); }   清驱动缓冲
+  lock (gate) { buf.Clear(); }          清应用缓冲
+  writeDone.Reset();                    清信号位 ← 本题
+  sp.Write(...)
+  writeDone.WaitOne(TimeoutMs)          等新应答
+Handle 内：writeOk=true/false; writeDone.Set()  接收线程置信号

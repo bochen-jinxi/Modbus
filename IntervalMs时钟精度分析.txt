@@ -1,0 +1,86 @@
+IntervalMs=10 与 Windows 时钟节拍 15.6ms 失配分析
+====================================================
+
+一、问题（一段总览）
+Thread.Sleep(IntervalMs) 中 IntervalMs=10，但 Windows 默认时钟节拍约 15.6ms（1/64秒），Thread.Sleep(10) 实际睡眠约 15.6ms~31.2ms（向上取整到下一个时钟节拍），比设定值多 56%~212%。对 Modbus RTU 轮询功能无害（间隔偏大反而给从站更多处理时间、总线更安全），但代码"名不副实"——常量写 10ms 实际跑 15.6ms，意图与行为不一致，维护者看 10 会误以为精确 10ms。修复：IntervalMs 改成 15（匹配时钟节拍，Sleep(15)≈15.6ms，误差最小，名实相符），并加注释说明 Windows 时钟精度限制。不用 PreciseSleepMs——它虽能精确 10ms 但烧 CPU，发送间隔不需要 3.65ms 级精度。
+
+二、Windows 时钟节拍与 Thread.Sleep 精度（原理深挖）
+
+【Windows 默认时钟节拍 = 15.6ms】
+  来源：系统定时器中断频率默认 64Hz（1/64 = 15.625ms）。
+  这个节拍决定了所有"挂起式等待"的分辨率：Thread.Sleep / WaitOne / Timer / Task.Delay。
+  Sleep(10) 的实际行为：
+    线程挂起 → 等下一个时钟中断唤醒 → 中断每 15.6ms 一次
+    → Sleep(10) 至少睡到下一个中断，实际 15.6ms（若刚错过一个节拍则 31.2ms）
+    → 公式：实际 ≈ ceil(10 / 15.6) * 15.6 = 1 * 15.6 = 15.6ms
+
+【能不能提高精度】
+  Win32 timeBeginPeriod(1) 可把节拍调到 1ms，但有全局副作用：
+    - 整个系统定时器变 1ms，所有线程的 Sleep/Timer 都变高频
+    - CPU 唤醒频繁、功耗上升（笔记本续航明显缩短）
+    - .NET 8 不自动调（旧版 .NET Framework 部分场景会调）
+  所以业界不推荐为"10ms间隔"这种非关键精度调全局节拍。
+
+【.NET 8 有没有改进】
+  Thread.Sleep 在 .NET 8 Windows 上仍走 SleepEx Win32 API，受时钟节拍限制。
+  没有内置高精度 Sleep（要高精度得自己 SpinWait 忙等，即本程序的 PreciseSleepMs）。
+
+三、IntervalMs 各取值对比（9600bps 轮询场景）
+
+值   | Sleep实际     | 名实误差 | 每站轮询周期 | 采样率/站 | CPU | 评价
+-----|--------------|---------|-------------|----------|-----|--------
+5    | ≈15.6ms      | 212%    | ≈42ms       | ≈12次/秒 | 低  | 浪费设定值，名实差最大
+10   | ≈15.6ms      | 56%     | ≈42ms       | ≈12次/秒 | 低  | 当前值，名不副实
+15   | ≈15.6ms      | 4%      | ≈42ms       | ≈12次/秒 | 低  | ★名实相符，推荐
+20   | ≈31.2ms      | 56%     | ≈57ms       | ≈9次/秒  | 低  | 跳两个节拍，采样率降
+30   | ≈31.2ms      | 4%      | ≈57ms       | ≈9次/秒  | 低  | 名实相符但间隔偏大
+10*  | =10ms(忙等)  | 0%      | ≈36ms       | ≈14次/秒 | 高  | PreciseSleepMs，烧CPU换精度
+
+*10 = 用 PreciseSleepMs(10) 替代 Sleep(10)
+
+轮询周期算法：发8字节8.3ms + 等应答18ms + 间隔 = 26.3ms + 间隔
+
+四、结论与修复
+
+【要不要改】要改。理由：
+  1.名实相符：IntervalMs=15 时 Sleep(15)≈15.6ms，误差4%，代码意图清晰
+  2.行为不变：当前 Sleep(10) 本就跑 15.6ms，改成 15 后实际行为几乎一样
+  3.不用 PreciseSleepMs：发送间隔不需要 3.65ms 级精度（那是帧定界用的），
+    Sleep 不烧 CPU，15.6ms 间隔对 RS485 半双工总线足够安全
+
+【改法】
+  const int IntervalMs = 15;   // 两次请求间隔。Windows时钟节拍15.6ms，Sleep(15)实际≈15.6ms
+
+【不改 TimeoutMs】TimeoutMs=50 是 WaitOne 的超时，不受时钟节拍影响那么大
+  （WaitOne 内部用可等待定时器，精度仍受节拍限制，但50ms远大于15.6ms，
+  向上取整到 62.4ms，余量足够，不影响"等不等得到应答"的判断）。
+
+五、诚实补充（所有我知道的信息）
+
+1. 15.6ms 不是铁定的，Windows 版本/电源策略/是否有程序调过 timeBeginPeriod 会变。
+   高精度多媒体程序（游戏/视频播放器）常调 timeBeginPeriod(1)，
+   此时整个系统 Sleep 精度变 1ms，Sleep(10)≈10ms。
+   但 SCADA 程序不能假设别人调过，按默认 15.6ms 设计才稳。
+
+2. .NET 8 在 Linux 上 Thread.Sleep 精度约 1ms（Linux 时钟节拍默认 250Hz=4ms 或 1000Hz=1ms）。
+   本程序是 Windows 专用（用 System.IO.Ports 串口），不用考虑 Linux。
+
+3. 采样率影响：IntervalMs 10→15 行为不变（都 15.6ms），采样率不变（约12次/秒/站）。
+   若要提采样率，瓶颈不在间隔，而在一次交互的 18ms（9600bps 限速）。
+   提波特率到 115200：一次交互 1.5ms，间隔 15.6ms 成主导，此时可考虑 PreciseSleepMs。
+
+4. FrameGapLoop 的 PreciseSleepMs(PollMs=1.83ms) 必须忙等——
+   Sleep(1.83) 会睡 15.6ms，帧超时检测彻底失效。
+   这是为什么帧定界用 SpinWait 而发送间隔用 Sleep 的根本区别：
+   帧定界要 3.65ms 级（< 15.6ms，必须忙等），发送间隔要 10ms 级（> 15.6ms，Sleep 够）。
+
+5. 如果未来要精确 10ms 间隔且不烧 CPU，正确做法是调 timeBeginPeriod(1)：
+   [DllImport("winmm")] static extern void timeBeginPeriod(int period);
+   Main 开头调 timeBeginPeriod(1)，退出调 timeEndPeriod(1)。
+   但全局副作用大，为 10ms 间隔不值得，15ms 够用。
+
+六、记忆口诀
+
+「Windows 时钟 15.6ms，Sleep(10) 实睡 15.6；名不副实改 15，误差 4% 名实符；
+ 帧定界 3.65ms 必须忙等（< 节拍），发送间隔 15ms 用 Sleep（> 节拍）；
+ 提精度调 timeBeginPeriod 全局副作用大，15ms 间隔够用不折腾」

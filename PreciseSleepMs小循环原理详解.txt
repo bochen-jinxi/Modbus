@@ -1,0 +1,127 @@
+FrameGapLoop 里 PreciseSleepMs 小循环原理详解
+==================================================
+
+一、核心一段（先回答你的困惑）
+FrameGapLoop 的大循环 while(running) 每"轮"做一件事：读最后收数据时刻 → 算距现在过了多久 → 超过 3.65ms 就判帧结束调 OnFrameGap。每轮末尾要"睡一会儿再查下一轮"——这个"一会儿"是 PollMs=1.83ms。但 Thread.Sleep(1.83) 在 Windows 上会睡 15.6ms（时钟节拍限制），检测频率从每 1.83ms 变成每 15.6ms，而帧超时阈值才 3.65ms——15.6ms 查一次可能漏判帧结束。所以用 PreciseSleepMs 替代 Sleep：它内部是个 while 小循环，用 Stopwatch 精确计时，没到目标时间就 SpinWait(20) 忙等（不挂起线程、烧 CPU 换微秒级精度），到了就返回。大循环管"一直跑直到退出"，小循环管"精确睡 1.83ms 再进下一轮"，两层循环各管各的。
+
+二、两层循环各管什么（逐行标注）
+
+大循环 while(running) —— 第166行，管"生命周期"：
+    while (running)                          // ① 大循环：running=true一直跑，Ctrl+C变false退出
+    {
+        long last = Interlocked.Read(...);   // ② 读最后收数据时刻
+        if (last != 0 && last != handled)    // ③ 有数据且没处理过
+        {
+            double gapMs = ...;              // ④ 算距最后收数据过了多久
+            if (gapMs >= FrameGapMs)         // ⑤ 超过3.65ms=帧结束
+            {
+                handled = last;              // ⑥ 标记这批已处理
+                OnFrameGap();                // ⑦ 切帧+处理残帧
+            }
+        }
+        PreciseSleepMs(PollMs);              // ⑧ 小循环：精确睡1.83ms再查下一轮
+    }
+
+小循环 PreciseSleepMs 内部 —— 第202行，管"精确睡多久"：
+    static void PreciseSleepMs(double ms)
+    {
+        long target = (long)(ms / 1000.0 * Stopwatch.Frequency);  // 目标ticks=1.83ms换算成Stopwatch刻度
+        long start = sw.ElapsedTicks;                              // 记开始时刻
+        while (sw.ElapsedTicks - start < target)                   // 还没到目标时间
+        {
+            Thread.SpinWait(20);                                   // 忙等20次自旋再查
+        }
+        // 到了，返回 → 大循环进下一轮
+    }
+
+大循环 = "每隔1.83ms检查一次帧超时，直到退出"
+小循环 = "精确等1.83ms"（用Stopwatch计时+SpinWait忙等，不用Sleep）
+
+三、为什么小循环不能用 Thread.Sleep（关键）
+
+【如果改成 Thread.Sleep(PollMs) 会怎样】
+  PollMs = 1.83ms（9600下）
+  Thread.Sleep(1.83) 实际睡 15.6ms（Windows时钟节拍，向上取整）
+  → 检测频率从每 1.83ms 变成每 15.6ms
+  → 帧超时阈值 FrameGapMs = 3.65ms
+  → 15.6ms 查一次，但帧结束后 3.65ms 就该触发
+  → 最坏情况：帧结束后 0ms 刚查完上一轮，要等 15.6ms 才查下一轮
+  → 帧结束检测延迟最坏 15.6ms，远超 3.65ms
+  → 后果：静默期被错过，下一帧数据来了才触发，帧定界失效
+
+【时序对比】
+  用 PreciseSleepMs（正确）：
+    t=0ms    收完一帧，lastDataTicks更新
+    t=1.83ms 查：gap=1.83 < 3.65，不触发
+    t=3.66ms 查：gap=3.66 ≥ 3.65，触发OnFrameGap ✓
+    检测延迟：3.66ms（仅多0.01ms）
+
+  用 Thread.Sleep（错误）：
+    t=0ms    收完一帧，lastDataTicks更新
+    t=0ms    Sleep(1.83)→实际睡15.6ms
+    t=15.6ms 查：gap=15.6 ≥ 3.65，触发OnFrameGap
+    检测延迟：15.6ms（多了12ms，期间下一帧可能已到、粘包）
+
+四、SpinWait(20) 在小循环里干什么
+
+  Thread.SpinWait(20) = "让CPU空转20次迭代再继续"
+  不是睡20ms！是烧20次自旋（约几十纳秒），然后回到while条件再查Stopwatch。
+  
+  为什么不直接 while(sw.ElapsedTicks - start < target) {} 空转：
+    纯空转（不调SpinWait）会让CPU 100%满载且影响超线程兄弟核。
+    SpinWait(20) 内部有轻微让步（某些架构会发PAUSE指令），减少对其他核的干扰，
+    但仍然是"忙等"——线程不挂起、不释放CPU时间片。
+  
+  代价：PreciseSleepMs 期间这个核被占满（忙等不让人）。
+  FrameGapLoop 基本全程烧满一个核——这是拿 CPU 换精度的已知代价。
+
+五、为什么 PollMs 取 FrameGapMs/2（1.83ms）
+
+  PollMs ≤ FrameGapMs/2 是采样定理的思路：
+    要检测一个 3.65ms 的事件，采样间隔必须 ≤ 事件宽度/2 = 1.83ms
+    → 保证事件发生期间至少查一次，不漏判
+  实际：PollMs=1.83ms，最坏检测延迟 = PollMs = 1.83ms < 3.65ms ✓
+  
+  115200bps 下：FrameGapMs=0.304ms，PollMs=0.152ms
+  → 小循环每 0.152ms 查一次，CPU 烧得更狠（基本 100% 一个核）
+
+六、完整数据流串起来看
+
+  串口来数据 → OnData → Interlocked.Exchange(ref lastDataTicks, sw.ElapsedTicks)
+  → FrameGapLoop 下一轮查：gap = now - lastDataTicks
+  → gap ≥ 3.65ms → OnFrameGap → DrainInLock切帧 + 取残帧 → Handle解析
+
+  PreciseSleepMs 在这个链里的角色：
+  控制 FrameGapLoop 多久查一次 gap，保证查得够频繁不漏判帧结束。
+
+七、诚实补充（所有我知道的信息）
+
+1. 更省 CPU 的做法（代码没用）：
+  不用忙等小循环，改用 Monitor.Wait(剩余时间) 挂起，OnData 每来一字节 Monitor.Pulse 唤醒。
+  拿"被唤醒"代替"轮询"，精度不减还不烧核。
+  但改动大（要加同步对象、改 OnData 加 Pulse），当前代码选 SpinWait 是拿 CPU 换实现简单。
+
+2. SpinWait(20) 的 20 是经验值，不是精确算出来的。
+  太小（如1）：纯空转，CPU 满载且影响兄弟核。
+  太大（如10000）：单次自旋太久，Stopwatch 查询频率降低，精度下降。
+  20 是 .NET 圈常见的"够让步但不太浪费"的折中值。
+
+3. Stopwatch.Frequency 在不同机器不同（通常等于 CPU 主频或 TSC 频率），
+  但 Stopwatch.ElapsedTicks / Stopwatch.Frequency 永远是秒，跟 Frequency 具体值无关。
+  所以 PreciseSleepMs 的计时是跨机器准确的。
+
+4. 小循环有个极端情况：如果线程在 PreciseSleepMs 里时 running 变 false，
+  小循环不会立即退出（它只看 Stopwatch 没看 running），最多多等 1.83ms 才回大循环顶检查 running。
+  1.83ms 延迟退出可接受（Ctrl+C 后多 1.83ms 退出感觉不到）。
+
+5. 前面改的 IntervalMs=15 用 Thread.Sleep 是对的——发送间隔 15ms > 时钟节拍 15.6ms，Sleep 够。
+  这里 PollMs=1.83ms < 时钟节拍 15.6ms，Sleep 不够，必须忙等。
+  这就是"帧定界用忙等、发送间隔用Sleep"的分界线：看你要的间隔是否大于 15.6ms。
+
+八、记忆口诀
+
+「大循环管生命周期（一直跑到退出），小循环管精确睡多久（Stopwatch计时+SpinWait忙等）；
+ Sleep 精度 15.6ms 测不出 3.65ms，必须忙等换微秒级；
+ PollMs ≤ FrameGapMs/2 = 1.83ms，保证不漏判帧结束；
+ SpinWait(20) 烧几十纳秒让步，忙等不挂起不释放CPU；
+ 帧定界 < 节拍必须忙等，发送间隔 > 节拍用 Sleep 够」

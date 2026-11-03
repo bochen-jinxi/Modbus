@@ -1,0 +1,79 @@
+volatile 的"单写"指单一写线程，不是单次写入
+============================================
+
+一、你的疑问
+说 volatile 适合"单写多读"，但 writeOk 在 Handle 里写了两次
+（writeOk=true 和 writeOk=false），怎么算单写？
+
+
+二、澄清："单写"= 单一写线程 ≠ 单次写入
+  单写：只有一个线程执行写操作（不管写几次、写什么值）。
+  多读：其他线程只读不写。
+  同一个写线程可以写无数次（true/false/true/false...），只要没有
+  第二个线程也写它，volatile 就安全。
+
+  writeOk 的写都在 Handle 里 → 都在接收线程（OnData→Handle）。
+  WriteSingleCoil（写线程）只读 writeOk，不写。
+  所以：写线程=接收线程（唯一），读线程=写线程。符合"单一写线程多读线程"。
+
+
+三、为什么"单一写线程"安全，"多写线程"不安全
+  单一写线程写 volatile bool：
+    写线程写 true 或 false，每次写是原子的 + 可见的。
+    读线程读到的，一定是写线程某次写的值（不会读到"半个"或"不存在"的值）。
+    写多次只是值在变，读线程看到值的切换，没有竞争。
+
+  多写线程写 volatile int（如两个线程都 i++）：
+    i++ 是 读→改→写 三步，volatile 只保证每步原子+可见，
+    不保证三步不被插队 → 丢增量。要 Interlocked.Increment。
+    两个线程都写，写之间会竞争，volatile 管不住 RMW。
+
+
+四、volatile 到底保证什么、不保证什么
+  保证：
+    1. 单次读/写对齐基本类型的原子性（不撕裂）。
+    2. 可见性：写线程写的值立刻对读线程可见（刷 CPU 缓存/内存屏障）。
+    3. 禁止编译器/CPU 对该变量的读写重排。
+  不保证：
+    1. 读-改-写（i++）的原子性 → 要 Interlocked。
+    2. 多写线程的写顺序/不丢写 → 要 lock 或 Interlocked。
+    3. 复合操作（check-then-act）的原子性 → 要 lock。
+
+
+五、本项目 volatile 用法核对
+  running (volatile bool)：
+    写：主线程（Ctrl+C 设 false）。读：SendLoop/FrameGapLoop/CmdLoop。
+    单一写线程（主线程），符合。
+
+  writeSlave (volatile byte)：
+    写：WriteSingleCoil（写线程）。读：Handle（接收线程）。
+    单一写线程，符合。
+
+  writeOk (volatile bool)：
+    写：Handle（接收线程），写 true 或 false 两次。读：WriteSingleCoil（写线程）。
+    单一写线程（接收线程），写多次无妨，符合。★ 本题
+
+  curWriteFrame (volatile byte[] 引用)：
+    写：WriteSingleCoil。读：Handle。
+    单一写线程，符合。注意：volatile 保护的是"引用"的读写，
+    不保护数组内容的并发改（本例 frame 内容不变，只换引用，安全）。
+
+
+六、什么时候 volatile 不够，要升级
+  1. 多线程都要写同一个变量 → volatile 不够，用 Interlocked 或 lock。
+  2. 要 i++/x+=1 → Interlocked。
+  3. 要"判断+操作"原子 → lock。
+  4. 要保护一个对象内部状态（如 List 的多个字段）→ lock。
+
+
+七、口诀
+volatile 单写不是写一次，是只有一个线程写；
+写多少次都安全，读的总是某个写过的值。
+两个线程都写就出事，RMW 要 Interlocked；
+判断加操作要 lock，单写多读 volatile 够。
+
+
+八、修正之前文档的表述
+  原文："适合单写多读的标志位"
+  应为："适合单一写线程、多读线程的标志位（写线程可写多次）"
+  writeOk 符合：接收线程是唯一写者，写 true/false 多次，写线程只读。

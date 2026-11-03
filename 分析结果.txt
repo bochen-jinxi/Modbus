@@ -1,0 +1,117 @@
+Modbus RTU 串口程序分析与写入功能扩展方案
+============================================
+
+一、问题与目标
+现有 Program.cs 只会"读"：用功能码 0x03 轮询从站 01、02 的保持寄存器，拿回温湿度。
+用户要加"写"：控制开关的开到位（ON）、关到位（OFF）。
+开关量输出在 Modbus 里叫"线圈（Coil）"，写单个线圈用功能码 0x05。
+
+
+二、现有程序在做什么（一段话讲完）
+程序打开 COM4（9600,N,8,1），启动两个后台线程：发送线程 SendLoop 循环对从站列表 {01,02} 发 0x03 读请求，每发一个就等 frameReceived 信号或 50ms 超时；帧超时检测线程 FrameGapLoop 用 Stopwatch 高精度判定"距最后一次收数据是否超过 3.5 字符时间（9600 下约 3.65ms）"，超过就认为一帧结束，调用 OnFrameGap 切帧。收数据走 DataReceived 事件→OnData 追加到 buf→Drain 尝试切帧。切帧用 FrameLength 算变长（0x03 应答 = 3+字节数+2），CRC 校验通过才取走，失败滑动 1 字节重新对齐。Handle 里还做了多从站校验：只有"当前在等的从站"的应答才算数，别的迟到应答直接忽略，防止请求-应答错位。CRC16 初值 0xFFFF、多项式 0xA001、低字节先。
+
+
+三、写入操作原理（功能码 0x05 写单个线圈）
+
+1. 请求帧格式（共 8 字节）
+   [从站地址][0x05][线圈地址H][线圈地址L][值H][值L][CRC_L][CRC_H]
+   值 = 0xFF00 表示 ON（开到位）
+   值 = 0x0000 表示 OFF（关到位）
+   注意：值只有这两个合法，写别的从站会返回异常码 0x03（非法数据值）。
+
+2. 应答帧格式（共 8 字节，就是请求的回显）
+   [从站地址][0x05][线圈地址H][线圈地址L][值H][值L][CRC_L][CRC_H]
+   收到回显且 CRC 对 = 写入成功。
+
+3. 开到位 / 关到位 的含义
+   开到位：执行"开"命令并收到从站正确回显，确认开关已动作到 ON 位置。
+   关到位：执行"关"命令并收到从站正确回显，确认开关已动作到 OFF 位置。
+   "到位"强调的是"命令已下发且被从站确认"，不是物理行程反馈（那要另读输入状态）。
+
+
+四、实现方案
+
+1. 加一个通用写线圈方法：
+   WriteSingleCoil(byte slave, ushort addr, bool on)
+   - 构造 6 字节请求 [slave,0x05,addrH,addrL,on?0xFF:0x00,0x00]
+   - 追加 CRC
+   - lock(io) 里 sp.Write 发出
+   - 等 writeDone 信号或超时，返回成功/失败
+   ★ 注意：等的是 writeDone，不是 frameReceived。
+     frameReceived 是"读操作"的应答信号（0x03 用），写操作用的是独立的 writeDone。
+     两者分开，避免读轮询和写命令互相误触发对方的等待。
+     writeDone 由接收线程在 Handle 里解析到 0x05 回显时 Set。
+
+2. 加两个便捷方法：
+   SwitchOn(byte slave, ushort addr)  → WriteSingleCoil(..., true)   开到位
+   SwitchOff(byte slave, ushort addr) → WriteSingleCoil(..., false)  关到位
+
+3. 在 Handle 里补 0x05 应答解析：
+   func==0x05 时，回显长度 8、CRC 对即成功，置 writeOk=true 并 Set writeDone 通知写线程。
+   func==0x85（异常响应）时，置 writeOk=false 并 Set writeDone，写线程据此触发重试。
+
+4. 加一个控制台命令线程，让用户能交互输入：
+   on 1 0    → 对从站01的线圈地址0执行开到位
+   off 1 0   → 对从站01的线圈地址0执行关到位
+   不破坏现有 SendLoop 轮询读，命令线程独立发写请求（共用 lock(io) 串口互斥）。
+
+
+五、CRC16 心算口诀（便于记忆）
+初值全1（0xFFFF），逐字节"异或进去"；
+每字节做8轮，看最低位：
+  末位为1 → 右移1位再异或 0xA001；
+  末位为0 → 只右移1位。
+算完所有字节，得到 CRC；发帧时低字节先、高字节后。
+一句话记："FFFF起步，逐字节异或，8轮看末位，1则移异A001，0则只移，末尾低高。"
+
+
+六、0x05 与 0x03 帧长对照
+0x03 请求 8 字节，应答变长 = 3 + 字节数 + 2
+0x05 请求 8 字节，应答固定 8 字节（回显）
+所以 FrameLength 里要加一句：func==0x05 时返回 8。
+
+
+七、线程安全注意
+写命令和读轮询都用 lock(io) 保护串口，不会同时写串口。
+但写命令期间 curSlave 会被 SendLoop 改写，所以写命令要自己管"等谁的应答"。
+简单做法：写命令时临时把 curSlave 设成目标从站，写完等应答，再恢复。
+更稳妥：给写命令单独一个 AutoResetEvent，Handle 里 0x05 应答 Set 这个新信号，
+不与读的 frameReceived 混用，彻底避免读写互相误触发。本方案采用后者。
+
+
+八、涉及修改清单
+1. 新增字段：static readonly AutoResetEvent writeDone = new AutoResetEvent(false);
+2. 新增方法：WriteSingleCoil / SwitchOn / SwitchOff
+3. Handle 内新增 func==0x05 分支
+4. FrameLength 内新增 func==0x05 返回 8
+5. Main 内新增命令解析线程 CmdLoop
+6. using 可能要加 System.Globalization（解析命令用）
+
+
+九、写命令失败重试机制（新增）
+执行 on/off 命令可能失败（从站掉线、总线干扰、CRC错），需要重试。
+
+1. 重试次数：常量 WriteRetry = 3，最多发 3 次。
+2. 触发重试的两种失败：
+   - 超时：writeDone.WaitOne(TimeoutMs) 返回 false（50ms 没回显）。
+   - 异常响应：从站回 0x85（功能码0x05的最高位置1），writeOk=false。
+3. 每次重试前必须清干净接收状态，否则上一轮的迟到应答/残帧会污染本轮：
+   - lock(io) sp.DiscardInBuffer()  清驱动缓冲
+   - lock(gate) buf.Clear()         清已攒的残帧
+   - writeDone.Reset()              清残留信号
+   锁顺序 io→gate，与 OnData 一致，不会死锁。
+4. 成功判定：writeDone 置位 且 writeOk==true 才算到位确认，立即返回 true。
+5. 重试间隔 IntervalMs(15ms)，避免连续轰炸 RS485 总线。
+6. 全部重试失败返回 false，CmdLoop 打印"执行失败"。
+
+一句话记重试口诀：
+"发前清三样（驱动缓冲、残帧、信号），等回显看 writeOk，超时异常都重试，三次不成算失败。"
+
+
+十、writeOk 标志的作用
+writeDone 只表示"应答到了"，不区分成功还是异常。
+writeOk 由接收线程在 Handle 里设置：
+  - 0x05 正常回显 → writeOk=true
+  - 0x85 异常响应 → writeOk=false
+写线程等到 writeDone 后再读 writeOk，决定是返回成功还是继续重试。
+两个都是 volatile，保证跨线程可见性。
