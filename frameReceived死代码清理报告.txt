@@ -1,0 +1,181 @@
+================================================================================
+frameReceived 死代码分析与清理报告
+================================================================================
+分析时间：2026-11-04
+分析对象：F:\chenbo\Program.cs 中 frameReceived 的使用状态
+编译结果：Build succeeded. 0 Error(s)
+================================================================================
+
+
+一、用户问题
+================================================================================
+frameReceived 代码这没有 WaitOne 了？为啥？
+
+
+二、结论：frameReceived 已成为死代码，已清理删除
+================================================================================
+经过前几轮修复，SendLoop 周期轮询改用 pollAck.WaitOne()，
+frameReceived 只剩 Set() 没有 WaitOne()，成了"只点灯没人看"的死信号。
+已删除 frameReceived 字段和所有 frameReceived.Set() 调用。
+
+
+三、frameReceived 的历史演变
+================================================================================
+
+3.1 最初设计
+--------------------------------------------------------------------------------
+  static readonly AutoResetEvent frameReceived = new AutoResetEvent(false);
+
+  SendLoop 周期轮询：
+    frameReceived.WaitOne(TimeoutMs)   // 等应答
+  Handle 收到 0x03/0x04 应答：
+    frameReceived.Set()                // 通知 SendLoop
+
+  作用：全局应答信号，SendLoop 等它，Handle 点它。
+
+3.2 第一轮修复（curSlave=0xFF + Reset 顺序）
+--------------------------------------------------------------------------------
+  发现问题：超时 Reset 后迟到应答再 Set，下一轮 WaitOne 误判。
+  修复：超时后 curSlave=0xFF 阻断迟到应答校验。
+  frameReceived 仍在用（WaitOne + Set）。
+
+3.3 第二轮修复（独立信号 pollAck + 序号）
+--------------------------------------------------------------------------------
+  发现问题：curSlave=0xFF 和 Reset 之间有残留窗口。
+  修复：引入 pollAck + curPollSeq，SendLoop 改用 pollAck.WaitOne()。
+  frameReceived.WaitOne 被替换为 pollAck.WaitOne。
+  Handle 中 Set 改为：
+    if (curPollSeq > 0) pollAck.Set();
+    else frameReceived.Set();   // ← 残留的"兼容"分支
+
+3.4 第三轮修复（bool 替代 int 序号）
+--------------------------------------------------------------------------------
+  发现问题：int 序号溢出后正变负，逻辑反转。
+  修复：用 volatile bool pollActive 替代 int curPollSeq。
+  frameReceived 仍残留 else 分支。
+
+3.5 现状（本次分析）
+--------------------------------------------------------------------------------
+  grep frameReceived 结果：
+    - 字段声明：1 处
+    - Set 调用：3 处（都是 else 分支）
+    - WaitOne：0 处 ← ★ 没有人等它了！
+  frameReceived 成了"只 Set 不 Wait"的死信号。
+
+
+四、为什么 frameReceived.WaitOne 消失了
+================================================================================
+
+4.1 SendLoop 周期轮询改用 pollAck.WaitOne
+--------------------------------------------------------------------------------
+  原：if (!frameReceived.WaitOne(TimeoutMs))
+  新：if (!pollAck.WaitOne(TimeoutMs))
+  这是第二轮修复时改的，目的是用独立信号避免全局信号竞态。
+
+4.2 参数模式从不用 frameReceived
+--------------------------------------------------------------------------------
+  参数模式（dotnet run on 1 0）只做写操作（SwitchOn/SwitchOff）：
+    SwitchOn → WriteSingleCoil → writeQueue → WriteLoop → ExecuteWrite
+    ExecuteWrite 用 wr.Ack.WaitOne（WriteRequest 独立信号）
+  不启动 SendLoop，不做读操作，不用 frameReceived。
+
+4.3 WriteRequest/ReadRequest 各自用独立 Ack
+--------------------------------------------------------------------------------
+  WriteRequest.Ack：写线圈应答信号
+  ReadRequest.Ack：读寄存器应答信号
+  都不用 frameReceived。
+
+4.4 结论
+--------------------------------------------------------------------------------
+  没有任何代码路径会 frameReceived.WaitOne。
+  frameReceived.Set() 点亮的灯没有人等，纯死代码。
+
+
+五、frameReceived.Set() 的 else 分支分析
+================================================================================
+
+5.1 Handle 中 3 处 else frameReceived.Set()
+--------------------------------------------------------------------------------
+  位置1：0x03/0x04 异常响应，activeRead==null 且 pollActive==false
+    → else frameReceived.Set()
+    语义：无活跃读请求时收到异常响应，点全局灯。
+    现状：没人等这个灯，Set 无意义。
+
+  位置2：其他异常响应，pollActive==false
+    → else frameReceived.Set()
+    同上，无意义。
+
+  位置3：0x03/0x04 正常应答，pollActive==false
+    → else frameReceived.Set()
+    同上，无意义。
+
+5.2 这些 else 分支什么时候触发？
+--------------------------------------------------------------------------------
+  pollActive==false 意味着"没有活跃的周期轮询请求"：
+    - SendLoop 超时后（pollActive=false）
+    - 参数模式（不启动 SendLoop，pollActive 初始 false）
+  这两种情况下收到的应答都是"没人要的"迟到/意外应答。
+  原来 Set frameReceived 是想"通知有人"，但没有人 WaitOne，Set 无效。
+
+5.3 清理后的行为
+--------------------------------------------------------------------------------
+  else 分支改为：什么都不做（丢弃）。
+  语义：无活跃请求时收到应答 → 丢弃（没有人等它）。
+  这是正确的——迟到/意外应答本就该丢弃。
+
+
+六、清理内容
+================================================================================
+
+6.1 删除字段声明
+--------------------------------------------------------------------------------
+  删除：static readonly AutoResetEvent frameReceived = new AutoResetEvent(false);
+
+6.2 删除 3 处 else frameReceived.Set()
+--------------------------------------------------------------------------------
+  位置1（异常响应 0x03/0x04）：
+    else if (pollActive) pollAck.Set();
+    // else：无活跃请求（已超时），丢弃，不 Set 任何信号
+
+  位置2（其他异常响应）：
+    if (pollActive) pollAck.Set();
+    // else：无活跃请求（已超时），丢弃，不 Set 任何信号
+
+  位置3（0x03/0x04 正常应答）：
+    if (pollActive) pollAck.Set();
+    // else：无活跃请求（已超时），丢弃，不 Set 任何信号
+
+6.3 更新注释
+--------------------------------------------------------------------------------
+  将注释中"frameReceived"引用更新为"pollAck"或删除。
+
+
+七、清理后的信号体系
+================================================================================
+
+  信号          | 用途                        | 谁 Wait      | 谁 Set
+  --------------|----------------------------|--------------|----------
+  pollAck       | 周期轮询读应答              | SendLoop     | Handle(0x03/0x04, pollActive)
+  pollActive    | 周期轮询活跃标记            | -            | SendLoop(发前置true, 超时置false)
+  wr.Ack        | 写线圈应答(每请求独立)      | ExecuteWrite | Handle(0x05)
+  rr.Ack        | 读寄存器应答(每请求独立)    | ExecuteRead  | Handle(0x03/0x04, activeRead)
+  wr.Completed  | 写请求完成通知              | WriteSingleCoil | WriteLoop
+  rr.Completed  | 读请求完成通知              | (未使用)     | (未使用)
+
+  ★ 每个信号都有明确的 Wait 和 Set，无死信号。
+  ★ frameReceived 已彻底删除。
+
+
+八、总结
+================================================================================
+用户发现 frameReceived 没有 WaitOne 了，问为啥。
+原因：前几轮修复把 SendLoop 周期轮询改用 pollAck.WaitOne()，
+frameReceived 只剩 Set 没有 Wait，成了死代码。
+
+已清理：删除 frameReceived 字段和所有 Set 调用。
+else 分支改为"丢弃"（无活跃请求时收到应答，无人等，丢弃）。
+编译通过，零错误。信号体系清晰，无死信号。
+
+================================================================================
+                          清理报告结束
+================================================================================

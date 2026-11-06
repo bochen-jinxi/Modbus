@@ -7,3 +7,6 @@ obj/
 
 # CodeArts 工具临时目录
 .codeartsdoer/
+
+# Windows 保留设备名（误创建）
+nul

@@ -1,0 +1,212 @@
+================================================================================
+SendLoop 发完释放 io 锁后总线撞车场景分析
+================================================================================
+分析时间：2026-11-04
+分析对象：F:\chenbo\Program.cs SendLoop / WriteLoop / ExecuteWrite 的锁层次
+================================================================================
+
+
+一、用户问题
+================================================================================
+SendLoop 发完释放 io 锁，ExecuteWrite 抢到 io 锁发写帧，
+此时从站可能还在回 SendLoop 的读应答，总线撞车。
+
+
+二、结论：当前代码不会撞车，busLock 保证了互斥
+================================================================================
+用户描述的场景不会发生。SendLoop 持 busLock 期间，
+WriteLoop 拿不到 busLock，不会执行 ExecuteWrite，不会抢 io 锁发写帧。
+
+但分析过程中发现了一个真实的隐患（见第六节）。
+
+
+三、锁层次梳理
+================================================================================
+
+3.1 两层锁
+--------------------------------------------------------------------------------
+  busLock：总线事务锁（"整个事务独占总线"）
+    SendLoop：Monitor.TryEnter(busLock, 0)  非阻塞试，拿不到跳过
+    WriteLoop：lock(busLock)                 阻塞等，保证写一定能执行
+
+  io：串口读写锁（"单次 sp.Write/sp.Read 互斥"）
+    SendFrame：lock(io){ sp.Write }         发完立即释放
+    OnData：lock(io){ sp.Read }             读完立即释放
+
+3.2 SendLoop 的持锁时序
+--------------------------------------------------------------------------------
+  Monitor.TryEnter(busLock)  ← 拿到 busLock
+    SendFrame(frame)          ← 内部 lock(io){ sp.Write } → 发完释放 io
+    pollAck.WaitOne(50ms)     ← ★ 仍持 busLock，等应答
+    （超时或收到应答）
+  Monitor.Exit(busLock)       ← 释放 busLock
+
+  ★ 关键：SendLoop 在 pollAck.WaitOne 期间一直持着 busLock！
+    io 锁在 SendFrame 返回时就释放了，但 busLock 直到 WaitOne 结束才释放。
+
+3.3 WriteLoop 的持锁时序
+--------------------------------------------------------------------------------
+  lock(busLock)               ← 阻塞等 busLock
+    ExecuteWrite(wr)           ← 内部 SendFrame → lock(io){ sp.Write }
+  Monitor.Exit(busLock)       ← 释放 busLock
+
+  ★ WriteLoop 要拿 busLock 才能执行 ExecuteWrite。
+
+
+四、用户描述的场景时序分析
+================================================================================
+
+4.1 用户设想的时序
+--------------------------------------------------------------------------------
+  t=0   SendLoop: SendFrame → lock(io){ sp.Write(读请求) } → 释放 io
+  t=0   SendLoop: pollAck.WaitOne(50ms)  ← 等 pollAck，但 io 已释放
+  t=1   ExecuteWrite: lock(io){ sp.Write(写请求) }  ← ★ 用户设想：抢到 io 发写帧
+  t=2   从站还在回 SendLoop 的读应答 → 总线上同时有写请求和读应答 → 撞车
+
+4.2 为什么不会发生
+--------------------------------------------------------------------------------
+  t=0   SendLoop: 持有 busLock（TryEnter 拿到的）
+  t=0   SendLoop: SendFrame → 释放 io，但 busLock 还持着
+  t=0   SendLoop: pollAck.WaitOne(50ms)  ← 仍持 busLock
+  t=1   WriteLoop: lock(busLock)  ← ★ 阻塞！SendLoop 还持着 busLock，拿不到！
+  t=1   WriteLoop: 等待 busLock...  ← 不会执行 ExecuteWrite，不会抢 io 锁
+
+  ★ ExecuteWrite 连 busLock 都拿不到，更别说 io 锁了。
+    SendLoop 的 busLock 在 pollAck.WaitOne 结束（收到应答或超时）后才释放。
+    所以 ExecuteWrite 不可能在 SendLoop 等应答期间发写帧。
+
+4.3 busLock 的作用正是防止这个
+--------------------------------------------------------------------------------
+  busLock 是"总线事务锁"，语义是"整个事务（发请求+等应答）独占总线"。
+  SendLoop 拿 busLock → 发请求 → 等应答 → 释放 busLock。
+  期间 WriteLoop 拿不到 busLock，不会发写帧。
+  这就是 busLock 存在的意义——防止"读请求发出后、应答收到前"被写事务打断。
+
+
+五、穷举所有线程交错时序（主动构造反例）
+================================================================================
+
+5.1 时序 A：SendLoop 读事务进行中，WriteLoop 想写
+--------------------------------------------------------------------------------
+  t=0   SendLoop: TryEnter(busLock) 成功
+  t=1   SendLoop: SendFrame(读请求) → 释放 io
+  t=2   SendLoop: pollAck.WaitOne  ← 持 busLock 等
+  t=3   WriteLoop: lock(busLock) ← 阻塞等
+  t=20  从站应答到达 → Handle → pollAck.Set
+  t=20  SendLoop: WaitOne 返回 → Exit(busLock)
+  t=21  WriteLoop: 拿到 busLock → ExecuteWrite → SendFrame(写请求)
+  ★ 安全：写请求在读应答收到后才发，不撞车
+
+5.2 时序 B：SendLoop 读超时，WriteLoop 想写
+--------------------------------------------------------------------------------
+  t=0   SendLoop: TryEnter(busLock) 成功
+  t=1   SendLoop: SendFrame(读请求)
+  t=2   SendLoop: pollAck.WaitOne(50ms) 超时
+  t=52  SendLoop: ClearRxState + pollActive=false + Exit(busLock)
+  t=53  WriteLoop: 拿到 busLock → ExecuteWrite → SendFrame(写请求)
+  ★ 安全：超时后 SendLoop 释放 busLock，WriteLoop 才发写请求
+  ★ 但此时从站的迟到应答可能还在路上（见第六节）
+
+5.3 时序 C：WriteLoop 写事务进行中，SendLoop 想读
+--------------------------------------------------------------------------------
+  t=0   WriteLoop: lock(busLock) 成功
+  t=1   WriteLoop: ExecuteWrite → SendFrame(写请求) → 释放 io
+  t=2   WriteLoop: wr.Ack.WaitOne  ← 持 busLock 等回显
+  t=3   SendLoop: TryEnter(busLock, 0) ← 失败！WriteLoop 持着 busLock
+  t=3   SendLoop: Thread.Sleep(15) → continue  ← 跳过本轮读
+  t=20  从站回显到达 → Handle → wr.Ack.Set
+  t=20  WriteLoop: WaitOne 返回 → Exit(busLock)
+  t=21  SendLoop: TryEnter(busLock) 成功 → 发读请求
+  ★ 安全：写事务期间 SendLoop 跳过读，不撞车
+
+5.4 时序 D：SendLoop 和 WriteLoop 同时抢 busLock
+--------------------------------------------------------------------------------
+  t=0   SendLoop: TryEnter(busLock, 0)
+  t=0   WriteLoop: lock(busLock)
+  ★ busLock 同一时刻只有一个能拿到：
+    - 如果 SendLoop 先拿到：WriteLoop 阻塞等 → 时序 A/C
+    - 如果 WriteLoop 先拿到：SendLoop TryEnter 失败跳过 → 时序 C
+  ★ 安全：busLock 互斥保证不会同时发
+
+
+六、发现的真实隐患：超时后迟到应答与写请求撞车
+================================================================================
+
+6.1 场景
+--------------------------------------------------------------------------------
+  t=0   SendLoop: TryEnter(busLock) 成功
+  t=1   SendLoop: SendFrame(读请求@从站1)
+  t=2   SendLoop: pollAck.WaitOne(50ms) 超时
+  t=52  SendLoop: ClearRxState + pollActive=false + Exit(busLock)
+        ★ 从站1的应答还在路上（迟到），还没到串口
+  t=53  WriteLoop: 拿到 busLock → ExecuteWrite
+  t=54  ExecuteWrite: ClearRxState → SendFrame(写请求@从站1)
+        ★ ClearRxState 清了驱动缓冲，但迟到应答还没到，清不到
+  t=55  从站1的迟到应答到达串口 → OnData → Handle
+        ★ 此时 ExecuteWrite 正在等 wr.Ack（写回显）
+        ★ 迟到的是 0x03 读应答，不是 0x05 写回显
+  t=56  Handle: func=0x03 → activeRead==null, pollActive==false → 不 Set 任何信号
+        ★ 迟到应答被丢弃，不影响 ExecuteWrite
+  t=57  从站1的写回显到达 → Handle → func=0x05 → activeWrite.Set → ExecuteWrite 成功
+
+  ★ 分析：迟到应答被丢弃（pollActive=false），不撞车。
+    但物理层面：从站1在回读应答的同时收到了写请求，从站1能处理吗？
+
+6.2 物理层面的撞车
+--------------------------------------------------------------------------------
+  RS485 是半双工总线，同一时刻只能有一个方向传输。
+  t=54  ExecuteWrite 发写请求（主机→从站1）
+  t=55  从站1的迟到读应答到达（从站1→主机）
+  ★ 这两个信号在总线上对冲！RS485 半双工不支持同时双向！
+
+  但实际上：
+  - t=54 主机发完写请求后，总线进入"等从站回显"状态
+  - t=55 从站1的迟到读应答是"从站1→主机"方向
+  - 主机发完写请求后已经切换为接收模式（RS485 收发切换）
+  - 从站1的迟到应答会被主机收到（当作"写回显"或"杂音"）
+
+  ★ 风险：迟到应答的字节可能被误当成写回显的一部分，导致 CRC 错或错位。
+  ★ 但 ClearRxState 在 ExecuteWrite 发前已清缓冲，迟到应答在 ClearRxState 之后才到，
+    会被正常收进 buf，Handle 会处理它。
+  ★ Handle 中 func=0x03（读应答）≠ 0x05（写回显），不会误当写回显。
+  ★ 但如果迟到应答的字节和写回显的字节交错到达，会粘帧 → CRC 错 → 丢弃。
+
+6.3 结论
+--------------------------------------------------------------------------------
+  逻辑层面：不撞车（busLock 互斥 + pollActive 丢弃迟到应答）
+  物理层面：迟到应答和写回显可能在总线上交错，导致粘帧/CRC 错。
+  但这是 RS485 半双工的固有限制——超时后从站的迟到应答无法阻止。
+  现有代码的 ClearRxState + CRC 校验 + 错位重对齐已经是最优处理：
+  - ClearRxState 清掉已到的数据
+  - 迟到的数据被收进 buf，CRC 校验失败则丢弃，错位则重对齐
+  - 最坏情况：这一轮写回显被迟到应答干扰，CRC 错 → 重试
+
+
+七、总结
+================================================================================
+
+7.1 用户描述的场景不会发生
+--------------------------------------------------------------------------------
+  SendLoop 持 busLock 期间等 pollAck，WriteLoop 拿不到 busLock，
+  不会抢 io 锁发写帧。busLock 正是为此设计。
+
+7.2 真实隐患：超时后迟到应答与写请求的物理撞车
+--------------------------------------------------------------------------------
+  SendLoop 超时释放 busLock 后，WriteLoop 发写请求，
+  此时从站的迟到读应答可能和写回显在总线上交错。
+  逻辑层面不撞车（pollActive 丢弃迟到应答），
+  物理层面可能粘帧/CRC 错，但 ClearRxState + CRC 校验 + 重对齐已处理。
+  最坏情况：写回显被干扰 → CRC 错 → 重试（WriteRetry=3）。
+
+7.3 现有代码的处理已足够
+--------------------------------------------------------------------------------
+  - busLock 保证"发请求+等应答"期间不被打断
+  - 超时后 ClearRxState 清缓冲
+  - 迟到应答被 pollActive=false 丢弃（逻辑层面）
+  - CRC 校验 + 错位重对齐处理粘帧（物理层面）
+  - 写命令有 WriteRetry=3 重试兜底
+  无需额外修改。
+
+================================================================================
+                          分析报告结束
+================================================================================

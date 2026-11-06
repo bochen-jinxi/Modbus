@@ -18,8 +18,16 @@ namespace ModbusDemo
         static SerialPort sp;
         static volatile bool running = true;
 
-        // 同步信号：收到一帧有效应答时置位，通知发送线程"可以发下一个了"
-        static readonly AutoResetEvent frameReceived = new AutoResetEvent(false);
+        // ★★★ 周期轮询读的独立信号 + 活跃标记（彻底解决超时后迟到应答误 Set 全局信号问题）。
+        //   原来用全局 frameReceived(AutoResetEvent) 给周期轮询读用，超时 Reset 后迟到应答可能再 Set，
+        //   导致下一轮 WaitOne 误判。改用独立信号 pollAck + 活跃标记 pollActive：
+        //   - SendLoop 每次发请求前置 pollActive=true
+        //   - Handle 收到 0x03/0x04 周期轮询应答时，只有 pollActive==true 才 Set pollAck
+        //   - 超时后置 pollActive=false，迟到应答到达时 pollActive 已 false → 不 Set
+        //   ★ 不用 int 序号的正负判断（避免 int 溢出后正变负导致逻辑反转）。
+        //   ★ 不再用全局 frameReceived（已删除）：它只有 Set 没有 WaitOne，是死代码。
+        static readonly AutoResetEvent pollAck = new AutoResetEvent(false);
+        static volatile bool pollActive = false;  // 是否有活跃的周期轮询请求（true=有，false=已超时/无）
 
         // ★ 写操作请求（每个按钮一次写就是一个 WriteRequest，自带独立应答信号，互不干扰）。
         //   支持多按钮同时操作：多个请求进队列，写线程串行执行，每个独立等自己的回显。
@@ -45,6 +53,99 @@ namespace ModbusDemo
         //   接收线程 Handle 通过它把 0x05 回显分发给"正确的那个请求"，避免错配。
         //   volatile 保证接收线程能看到写线程的赋值。
         static volatile WriteRequest activeWrite;
+
+        // ★ 读操作请求（开到位成功后采集设备应答数据：转速/电压/电流等）。
+        //   与 WriteRequest 同构：每个读任务独立等自己的 0x03 应答，互不干扰。
+        //   读任务由 ExecuteWrite 成功后投递到 readQueue，SendLoop 优先消费。
+        class ReadRequest
+        {
+            public byte Slave;
+            public ushort StartAddr;
+            public ushort RegCount;
+            public string Tag;                 // 用途标识："转速"/"电压"/"电流"
+            public double Scale;               // 工程量换算系数（如 0.1 表示读出值*0.1）
+            public string Unit;                // 单位："RPM"/"V"/"A"
+            public byte[] Frame;               // 完整发送帧（含CRC），用于回显比对
+            public readonly AutoResetEvent Ack = new AutoResetEvent(false);
+            public bool AckOk;
+            public ushort[] Values;            // 读到的寄存器值
+            public readonly ManualResetEventSlim Completed = new ManualResetEventSlim(false);
+            public bool Result;
+        }
+
+        // ★★★ 0x02 读离散输入验证请求（强闭环：写线圈成功后验证物理设备真的到位了）。
+        //   与 ReadRequest 同构，但功能码是 0x02，应答按"位"解析。
+        class VerifyRequest
+        {
+            public byte Slave;
+            public ushort InputAddr;          // 离散输入地址
+            public bool ExpectOn;             // 期望值（true=ON 算到位）
+            public byte[] Frame;              // 完整发送帧（含CRC）
+            public readonly AutoResetEvent Ack = new AutoResetEvent(false);
+            public bool AckOk;
+            public bool ActualOn;             // 读到的实际值
+        }
+
+        // ★ 当前正在等 0x02 应答的验证请求（同一时刻只有一个，busLock 保证）。
+        static volatile VerifyRequest activeVerify;
+
+        // ★ 读请求队列：ExecuteWrite 成功后投递，SendLoop 优先消费。
+        //   事件触发的读优先于周期轮询的读（开到位后的数据更重要）。
+        static readonly ConcurrentQueue<ReadRequest> readQueue = new ConcurrentQueue<ReadRequest>();
+
+        // ★ 当前读线程正在等应答的请求（同一时刻只有一个，busLock 保证）。
+        //   接收线程 Handle 通过它把 0x03 应答分发给"正确的那个读任务"。
+        static volatile ReadRequest activeRead;
+
+        // ★ 设备读配置：写线圈地址 → 开到位后要读哪些数据。
+        //   key = (从站号, 线圈地址)，value = 该线圈开到位后要采集的数据描述列表。
+        //   例如：电机启动线圈0 开到位后，读 转速@0x0100 + 电压@0x0102 + 电流@0x0104。
+        //   DelayMs：开到位成功后延迟多少毫秒再读（等设备数据就绪，如电机转速上升）。
+        class ReadProfile
+        {
+            public string Tag;
+            public ushort StartAddr;
+            public ushort RegCount;
+            public double Scale;
+            public string Unit;
+            public int DelayMs;
+        }
+
+        // ★★★ 强闭环验证配置：写线圈成功后，读离散输入(0x02)验证物理设备真的到位了。
+        //   0x05 回显只表示"从站收到了命令"，不表示"设备真的启动了"。
+        //   读 0x02 离散输入（传感器信号，如"电机运行中"、"阀门到位"）才能确认物理状态。
+        //   VerifyAddr：离散输入地址（0x02 功能码读）
+        //   VerifyOnValue：期望值（true=ON，false=OFF）
+        //   VerifyDelayMs：写成功后延迟多少毫秒再读验证（等设备物理响应）
+        class VerifyProfile
+        {
+            public ushort VerifyAddr;       // 离散输入地址（0x02 功能码读）
+            public bool VerifyOnValue;      // 期望值（true=ON 算启动成功）
+            public int VerifyDelayMs;       // 写成功后延迟再读验证（等设备物理响应）
+        }
+
+        // ★ 读配置表：硬编码（简单直接，后续可扩展为 JSON 配置文件）。
+        //   示例：从站1 线圈0（电机启动）开到位后，延迟 500ms 读转速/电压/电流。
+        static readonly Dictionary<(byte slave, ushort coilAddr), ReadProfile[]> ReadProfiles =
+            new Dictionary<(byte, ushort), ReadProfile[]>
+            {
+                { (0x01, 0), new[]
+                    {
+                        new ReadProfile { Tag = "转速", StartAddr = 0x0100, RegCount = 1, Scale = 1.0,   Unit = "RPM", DelayMs = 500 },
+                        new ReadProfile { Tag = "电压", StartAddr = 0x0101, RegCount = 1, Scale = 0.1,   Unit = "V",   DelayMs = 500 },
+                        new ReadProfile { Tag = "电流", StartAddr = 0x0102, RegCount = 1, Scale = 0.01,  Unit = "A",   DelayMs = 500 },
+                    }
+                },
+            };
+
+        // ★★★ 强闭环验证配置表：写线圈成功后读 0x02 验证物理状态。
+        //   示例：从站1 线圈0（电机启动）写 ON 成功后，延迟 200ms 读离散输入地址 0x0000，
+        //   期望值为 ON(true) 才算"真正开到位"。
+        static readonly Dictionary<(byte slave, ushort coilAddr), VerifyProfile> VerifyProfiles =
+            new Dictionary<(byte, ushort), VerifyProfile>
+            {
+                { (0x01, 0), new VerifyProfile { VerifyAddr = 0x0000, VerifyOnValue = true, VerifyDelayMs = 200 } },
+            };
 
         // ★ 总线事务锁：RS485 半双工要求"整个事务（发+等应答）"独占总线，不能读写并发。
         //   SendLoop 用 TryEnter 非阻塞试，拿不到说明写事务在执行，跳过本轮读（写优先）。
@@ -165,8 +266,9 @@ namespace ModbusDemo
             Console.WriteLine("已退出。");
         }
 
-        // 发送线程（同步模式，多从站轮询）：
-        // 轮流对每个从站发请求 → 等该从站的应答 → 下一个从站。
+        // 发送线程（同步模式，多从站轮询 + 事件触发读）：
+        // ★ 优先消费 readQueue（开到位后的设备数据采集），没有才做周期轮询。
+        //   事件触发的读比周期轮询更重要（开到位后的转速/电压/电流是用户主动要的）。
         // RS485是半双工总线，同一时刻只能有一个从站应答。
         // ★ 用 busLock 事务级互斥：写事务执行时 TryEnter 失败，跳过本轮读（写优先）。
         static void SendLoop()
@@ -184,19 +286,26 @@ namespace ModbusDemo
                 }
                 try
                 {
+                    // ★ 优先消费 readQueue：开到位后的设备数据采集任务
+                    if (readQueue.TryDequeue(out var rr))
+                    {
+                        ExecuteRead(rr);
+                        Thread.Sleep(IntervalMs);   // 读任务间隔，避免连续轰炸总线
+                        continue;                    // 继续下一轮（可能还有读任务排队）
+                    }
+
                     byte id = Slaves[idx];
                     // 构造请求：从站地址id + 功能码03 + 起始地址0000 + 寄存器数N + CRC  Modbus RTU 的多字节字段也是"高字节先"（大端）：只有CRC 是小端（低字节先）
                     byte[] req = { id, 0x03, 0x00, 0x00, (byte)(RegCount >> 8), (byte)(RegCount & 0xFF) };
                     byte[] frame = Crc(req);
                     curSlave = id;                             // ★ 告诉接收线程：现在在等这个从站
+                    // ★★★ 独立信号 + 活跃标记：发请求前标记活跃，Handle 只在活跃时 Set pollAck。
+                    pollActive = true;
+                    pollAck.Reset();                           // 清上一次可能残留的信号
 
                     try
                     {
-                        lock (io)
-                        {
-                            if (!sp.IsOpen) break;
-                            sp.Write(frame, 0, frame.Length);
-                        }
+                        if (!SendFrame(frame)) break;
                     }
                     catch (Exception ex)
                     {
@@ -206,15 +315,19 @@ namespace ModbusDemo
                     }
                     if (Verbose) Console.WriteLine($"[发送→从站{id:X2}]{DateTime.Now:yyyy-MM-dd HH:mm:ss} {Hex(frame)}");
 
-                    if (!frameReceived.WaitOne(TimeoutMs))
+                    if (!pollAck.WaitOne(TimeoutMs))
                     {
                         if (Verbose) Console.WriteLine($"[超时] 从站{id:X2} {TimeoutMs}ms 没应答，清空接收状态后轮下一个");
                         // ★ 超时说明该从站的应答丢了/迟到。清空接收状态，防止迟到的旧应答
                         //   错配到下一个请求（否则请求-应答错位持续累积、buf堆积）。
                         //   锁顺序保持 io→gate（与OnData一致），不会死锁。
-                        lock (io) { if (sp.IsOpen) sp.DiscardInBuffer(); }   // 丢弃驱动缓冲里的旧数据
-                        lock (gate) { buf.Clear(); }                          // 丢弃已攒的残帧
-                        frameReceived.Reset();   // ★ 清掉可能残留的Set信号（应答迟到、在超时后才Set的），防止下一轮误判成功
+                        ClearRxState();   // 丢弃驱动缓冲旧数据 + 已攒残帧
+                        // ★★★ 彻底修复：用活跃标记 pollActive，不依赖 int 序号（避免溢出）。
+                        //   超时后置 pollActive=false，迟到应答检查 pollActive==false → 不 Set pollAck。
+                        //   下一轮发请求前会置 pollActive=true，不影响正常流程。
+                        pollActive = false;      // 失效活跃标记，迟到应答不 Set pollAck
+                        curSlave = 0xFF;         // 失效从站号（双保险）
+                        pollAck.Reset();
                     }
 
                     idx = (idx + 1) % Slaves.Length;
@@ -226,6 +339,30 @@ namespace ModbusDemo
                 // ★ 轮到下一个从站（循环轮询）
                 Thread.Sleep(IntervalMs);
             }
+        }
+
+        // ★ 清空接收状态：丢弃驱动缓冲里的旧数据 + 丢弃已攒的残帧。
+        //   SendLoop 超时分支、ExecuteWrite/ExecuteRead 每次发前都调用，复用统一。
+        //   锁顺序 io→gate（与 OnData 一致），不会死锁。
+        //   ★ 不含 Ack.Reset()：SendLoop 没有 wr.Ack/rr.Ack，调用方各自 Reset 自己的 Ack。
+        static void ClearRxState()
+        {
+            lock (io) { if (sp.IsOpen) sp.DiscardInBuffer(); }
+            lock (gate) { buf.Clear(); }
+        }
+
+        // ★ 发送一帧到串口。统一 IsOpen 检查 + lock(io) 保护。
+        //   返回 true=发送成功，false=串口已关闭。
+        //   ★ 不吞异常：sp.Write 可能抛异常（写超时/串口故障），调用方 try-catch 处理。
+        //   这样调用方可以保留自己的异常日志格式（发送异常/写异常/读异常）和重试逻辑。
+        static bool SendFrame(byte[] frame)
+        {
+            lock (io)
+            {
+                if (!sp.IsOpen) return false;
+                sp.Write(frame, 0, frame.Length);
+            }
+            return true;
         }
 
         // 步骤1：每收到一段就追加到缓冲区，并记录时刻
@@ -322,7 +459,7 @@ namespace ModbusDemo
 
             if (func == 0x05) return 8;                // ★ 写单个线圈应答：固定8字节（请求的回显）
 
-            if (func == 0x03 || func == 0x04)          // 读寄存器应答
+            if (func == 0x02 || func == 0x03 || func == 0x04)  // 读离散输入/读寄存器应答
             {
                 int byteCount = b[start + 2];
                 return 3 + byteCount + 2;              // 总长 = 3 + 字节数 + 2
@@ -389,10 +526,21 @@ namespace ModbusDemo
             byte func = frame[1];
 
             // ★ 多从站校验：应答帧的第1字节是"应答者地址"。
-            //   写线圈(0x05/0x85)用 activeWrite.Slave 校验，读操作用 curSlave 校验。
+            //   写线圈(0x05/0x85)用 activeWrite.Slave 校验，
+            //   0x02 验证读(0x02/0x82 且 activeVerify!=null)用 activeVerify.Slave 校验，
+            //   事件触发读(0x03/0x04 且 activeRead!=null)用 activeRead.Slave 校验，
+            //   周期轮询读用 curSlave 校验。
             //   只有"当前正在等的从站"的应答才算数；别的从站的迟到应答直接忽略，
             //   否则会错配（比如轮到从站2时，从站1的迟到应答被误当成从站2的）。
-            byte expect = (func == 0x05 || func == 0x85) ? (activeWrite?.Slave ?? 0) : curSlave;
+            byte expect;
+            if (func == 0x05 || func == 0x85)
+                expect = activeWrite?.Slave ?? 0;
+            else if (func == 0x02 || func == 0x82)
+                expect = activeVerify?.Slave ?? 0;
+            else if (activeRead != null)
+                expect = activeRead.Slave;
+            else
+                expect = curSlave;
             if (frame[0] != expect)
             {
                 Console.WriteLine($"[忽略] 从站 {frame[0]:X2} 的迟到应答（当前在等从站 {expect:X2}）");
@@ -410,7 +558,25 @@ namespace ModbusDemo
                     var aw = activeWrite;
                     if (aw != null) { aw.AckOk = false; aw.Ack.Set(); }
                 }
-                else frameReceived.Set();
+                else if (orig == 0x02)
+                {
+                    // ★ 0x02 验证读异常：通知当前活跃验证请求，AckOk=false 触发重试
+                    var av = activeVerify;
+                    if (av != null) { av.AckOk = false; av.Ack.Set(); }
+                }
+                else if (orig == 0x03 || orig == 0x04)
+                {
+                    // ★ 读异常：通知当前活跃读请求（别死等），AckOk=false 触发重试
+                    var ar = activeRead;
+                    if (ar != null) { ar.AckOk = false; ar.Ack.Set(); }
+                    else if (pollActive) pollAck.Set();       // 周期轮询读异常
+                    // else：无活跃请求（已超时），丢弃，不 Set 任何信号
+                }
+                else
+                {
+                    if (pollActive) pollAck.Set();
+                    // else：无活跃请求（已超时），丢弃，不 Set 任何信号
+                }
                 return;
             }
 
@@ -441,6 +607,32 @@ namespace ModbusDemo
                 return;
             }
 
+            // ★★★ 0x02 读离散输入应答：强闭环验证——确认物理设备真的到位了。
+            //   应答格式：从站 + 0x02 + 字节数 + 数据字节(位打包，LSB在前) + CRC
+            //   只读 1 个离散输入，数据 1 字节，bit0 就是状态。
+            if (func == 0x02)
+            {
+                var av = activeVerify;
+                if (av == null)
+                {
+                    if (Verbose) Console.WriteLine($"[忽略·0x02] 没有活跃验证请求，丢弃");
+                    return;
+                }
+                int byteCount = frame[2];
+                if (byteCount < 1)
+                {
+                    Console.WriteLine($"[验证错误·从站{frame[0]:X2}] 0x02 应答字节数为 0，丢弃");
+                    av.AckOk = false;
+                    av.Ack.Set();
+                    return;
+                }
+                // 位打包：第1字节的 bit0 是第1个离散输入的值
+                av.ActualOn = (frame[3] & 0x01) != 0;
+                av.AckOk = true;
+                av.Ack.Set();
+                return;
+            }
+
             // 03/04 读寄存器应答：按"字节数"字段动态解析 N 个寄存器
             if (func == 0x03 || func == 0x04)
             {
@@ -457,13 +649,44 @@ namespace ModbusDemo
                     Console.WriteLine();
                 }
 
+                // ★ 事件触发读（开到位后的设备数据采集）：按 activeRead 的 Tag/Scale/Unit 输出工程量
+                var ar = activeRead;
+                if (ar != null)
+                {
+                    ar.Values = new ushort[n];
+                    for (int i = 0; i < n; i++)
+                        ar.Values[i] = (ushort)((frame[3 + i * 2] << 8) | frame[4 + i * 2]);
+
+                    // 输出每个寄存器的工程量值
+                    for (int i = 0; i < n; i++)
+                    {
+                        double eng = ar.Values[i] * ar.Scale;
+                        Console.WriteLine($"[采集结果·从站{frame[0]:X2}] {ar.Tag} = {eng} {ar.Unit}（原始值={ar.Values[i]}）");
+                    }
+                    ar.AckOk = true;
+                    ar.Ack.Set();
+                    return;
+                }
+
+                // 周期轮询读：按原逻辑（温湿度）解析
                 if (n >= 2)
                 {
                     ushort t = (ushort)((frame[3] << 8) | frame[4]);
                     ushort h = (ushort)((frame[5] << 8) | frame[6]);
                     if (Verbose) Console.WriteLine($"[温湿度·从站{frame[0]:X2}] 温度 {t / 10.0} ℃，湿度 {h / 10.0} %RH");
                 }
-                frameReceived.Set();
+                // ★★★ 用独立信号 pollAck + 活跃标记 pollActive，替代全局 frameReceived.Set()。
+                //   只有 pollActive==true（有活跃的周期轮询请求）才 Set pollAck。
+                //   超时后 pollActive=false，迟到应答到达时 pollActive 已 false → 不 Set pollAck。
+                //   ★ bool 不存在溢出问题（只有 true/false 两个值），比 int 序号更健壮。
+                //   ★ 残留窗口分析：
+                //     时序1：Handle 读 curSlave(旧值1) → SendLoop 超时置 pollActive=false →
+                //           Handle 校验通过 → Handle 检查 pollActive(false) → 不 Set → 安全。
+                //     时序2：Handle 读 curSlave(旧值1) → Handle 校验通过 → Handle 检查 pollActive(true) →
+                //           Set pollAck → SendLoop 超时置 pollActive=false → SendLoop pollAck.Reset() → 灯灭 → 安全。
+                if (pollActive)
+                    pollAck.Set();
+                // else：无活跃请求（已超时），丢弃，不 Set 任何信号
             }
             else
             {
@@ -560,6 +783,7 @@ namespace ModbusDemo
 
         // ★ 实际执行一次写请求（含重试）。由 WriteLoop 串行调用，同一时刻只有一个活跃请求。
         //   ★ finally 清 activeWrite：防止写完成后迟到的回显拿旧 wr 比对（虽然整帧比对会拒绝，但清掉更干净）。
+        //   ★ 写成功后查 ReadProfiles，若该线圈有配置，投递读任务到 readQueue（异步采集设备应答数据）。
         static bool ExecuteWrite(WriteRequest wr)
         {
             byte slave = wr.Slave;
@@ -573,8 +797,7 @@ namespace ModbusDemo
                 {
                     // ★ 每次发前清干净接收状态，防止上一轮的迟到应答/残帧干扰本轮判定
                     //   锁顺序 io→gate（与 OnData 一致），不会死锁。
-                    lock (io) { if (sp.IsOpen) sp.DiscardInBuffer(); }
-                    lock (gate) { buf.Clear(); }
+                    ClearRxState();
                     wr.Ack.Reset();
 
                     // ★ 设为活跃请求：Handle 收到 0x05 回显时按此分发
@@ -584,11 +807,7 @@ namespace ModbusDemo
                     bool sendFailed = false;
                     try
                     {
-                        lock (io)
-                        {
-                            if (!sp.IsOpen) return false;
-                            sp.Write(frame, 0, frame.Length);
-                        }
+                        if (!SendFrame(frame)) return false;
                     }
                     catch (Exception ex)
                     {
@@ -603,20 +822,24 @@ namespace ModbusDemo
 
                         if (wr.Ack.WaitOne(TimeoutMs))
                         {
-                            if (wr.AckOk) return true;          // 成功回显，到位确认
+                            if (wr.AckOk)
+                            {
+                                // ★★★ 强闭环验证：0x05 回显只表示"从站收到命令"，
+                                //   不表示"设备真的启动了"。读 0x02 离散输入验证物理状态。
+                                //   验证通过才算"真正开到位"，验证失败则重试写命令。
+                                if (on && !VerifyPhysicalState(slave, addr))
+                                {
+                                    Console.WriteLine($"[验证失败·从站{slave:X2}] 线圈{addr} 写成功但物理状态未到位，继续重试");
+                                    continue;   // 物理状态未到位，重试写命令
+                                }
+                                // ★ 验证通过（或关到位无需验证），投递设备数据采集读任务
+                                if (on) EnqueueReadTasks(slave, addr);
+                                return true;          // 真正到位确认
+                            }
                             Console.WriteLine($"[写异常·从站{slave:X2}] 从站返回异常响应，继续重试");
                         }
                         else
                         {
-                            // ★ 超时后不立即放弃：回显可能正在途中（拆包，前半截已在 buf）。
-                            //   等一个帧间隔（3.65ms@9600）让后半截到齐，再切帧看能否凑成完整 0x05 回显。
-                            //   若凑齐且整帧匹配 → 当作迟到成功，避免清掉半截帧导致无谓重试。
-                            //   若仍不齐 → 才是真的超时，进入下一轮重试（下一轮开头会清缓冲）。
-                            if (TryConsumeLateAck(wr))
-                            {
-                                Console.WriteLine($"[迟到回显·从站{slave:X2}] 第{attempt}次 超时后凑齐回显，按成功处理");
-                                return true;
-                            }
                             Console.WriteLine($"[写超时·从站{slave:X2}] 第{attempt}次 {TimeoutMs}ms 没回显，继续重试");
                         }
                     }
@@ -628,47 +851,172 @@ namespace ModbusDemo
             finally
             {
                 activeWrite = null;        // ★ 写完清活跃引用，防止迟到回显拿旧 wr 比对
+                activeVerify = null;       // ★ 清验证引用，防止迟到 0x02 应答拿旧 vr 比对
             }
         }
 
-        // ★ 超时后尝试消费"迟到但已凑齐"的 0x05 回显。
-        //   场景: Ack.WaitOne 超时，但回显正在途中（拆包，前半截已在 buf）。
-        //         若立即进入下一轮清缓冲，会清掉前半截，后半截变残帧。
-        //   做法: 等一个帧间隔让后半截到齐 → 切帧 → 若有完整 0x05 且整帧匹配 wr.Frame → 消费它，返回 true。
-        //   注意: 只在超时后调用，且只消费"与当前 wr 整帧匹配"的回显，不会误吞别的请求的应答。
-        static bool TryConsumeLateAck(WriteRequest wr)
+        // ★★★ 强闭环验证：写线圈成功后，读 0x02 离散输入验证物理设备真的到位了。
+        //   在 ExecuteWrite 内同步执行（已在 busLock 内），验证通过返回 true，失败返回 false。
+        //   ★ 没有配置验证表的线圈直接返回 true（向后兼容，不强制所有线圈都验证）。
+        //   ★ 验证含重试：设备物理响应可能延迟，VerifyDelayMs 后读，读失败重试 WriteRetry 次。
+        static bool VerifyPhysicalState(byte slave, ushort coilAddr)
         {
-            // 等一个帧间隔（3.65ms@9600），让可能正在途中的后半截到齐。
-            // 用 PreciseSleepMs 而非 Thread.Sleep，保证 3.65ms 级精度（Thread.Sleep 最小 ~15.6ms）。
-            PreciseSleepMs(FrameGapMs);
+            // 没有配置验证的线圈，直接返回 true（向后兼容）
+            if (!VerifyProfiles.TryGetValue((slave, coilAddr), out var vp))
+                return true;
 
-            // 切帧：把 buf 里已凑齐的完整帧取出来
-            List<byte[]> frames;
-            lock (gate) { frames = DrainInLock(); }
+            // 延迟等设备物理响应（如电机启动需要时间）
+            if (vp.VerifyDelayMs > 0)
+                Thread.Sleep(vp.VerifyDelayMs);
 
-            foreach (var f in frames)
+            // 构造 0x02 读离散输入请求：从站 + 0x02 + 起始地址(2字节) + 数量1(2字节) + CRC
+            byte[] req = { slave, 0x02, (byte)(vp.VerifyAddr >> 8), (byte)(vp.VerifyAddr & 0xFF), 0x00, 0x01 };
+            byte[] frame = Crc(req);
+
+            for (int attempt = 1; attempt <= WriteRetry; attempt++)
             {
-                // 只认 0x05 回显，且整帧与当前请求的发送帧完全一致
-                if (f.Length >= 2 && f[1] == 0x05 && f.Length == wr.Frame.Length)
+                ClearRxState();
+                var vr = new VerifyRequest
                 {
-                    bool match = true;
-                    for (int i = 0; i < f.Length; i++)
+                    Slave = slave,
+                    InputAddr = vp.VerifyAddr,
+                    ExpectOn = vp.VerifyOnValue,
+                    Frame = frame,
+                };
+                activeVerify = vr;
+                vr.Ack.Reset();
+
+                bool sendFailed = false;
+                try
+                {
+                    if (!SendFrame(frame)) return false;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[验证发送异常·从站{slave:X2}] 第{attempt}次 {ex.Message}，继续重试");
+                    sendFailed = true;
+                }
+
+                if (!sendFailed)
+                {
+                    if (Verbose) Console.WriteLine($"[验证→从站{slave:X2}] 读离散输入{vp.VerifyAddr} 第{attempt}次");
+
+                    if (vr.Ack.WaitOne(TimeoutMs))
                     {
-                        if (f[i] != wr.Frame[i]) { match = false; break; }
+                        if (vr.AckOk)
+                        {
+                            bool matched = (vr.ActualOn == vp.VerifyOnValue);
+                            Console.WriteLine($"[验证结果·从站{slave:X2}] 离散输入{vp.VerifyAddr} = {(vr.ActualOn ? "ON" : "OFF")}，期望{(vp.VerifyOnValue ? "ON" : "OFF")}，{(matched ? "✓到位确认" : "✗未到位")}");
+                            return matched;
+                        }
+                        Console.WriteLine($"[验证异常·从站{slave:X2}] 从站返回异常响应，继续重试");
                     }
-                    if (match)
+                    else
                     {
-                        // CRC 已在 DrainInLock 校验过，整帧又匹配，确认是本请求的迟到回显
-                        ushort addr = (ushort)((f[2] << 8) | f[3]);
-                        bool on = (f[4] == 0xFF && f[5] == 0x00);
-                        Console.WriteLine($"[写线圈成功·从站{f[0]:X2}] 线圈{addr} = {(on ? "ON(开到位)" : "OFF(关到位)")}（迟到回显）");
-                        return true;
+                        Console.WriteLine($"[验证超时·从站{slave:X2}] 第{attempt}次 {TimeoutMs}ms 没应答，继续重试");
                     }
                 }
-                // 非 0x05 或不匹配的帧：交回 Handle 处理（可能是读应答等，不吞掉）
-                Handle(f);
+                Thread.Sleep(IntervalMs);
             }
+            Console.WriteLine($"[验证失败·从站{slave:X2}] 重试{WriteRetry}次仍未确认物理到位");
             return false;
+        }
+
+        // ★ 开到位成功后，按 ReadProfiles 配置投递设备数据采集读任务到 readQueue。
+        //   读任务带 DelayMs（等设备数据就绪，如电机转速上升），到点后由 SendLoop 执行。
+        //   异步投递不阻塞写线程，读任务在 SendLoop 排队执行。
+        static void EnqueueReadTasks(byte slave, ushort coilAddr)
+        {
+            if (!ReadProfiles.TryGetValue((slave, coilAddr), out var profiles)) return;
+            foreach (var p in profiles)
+            {
+                // 构造 0x03 读保持寄存器请求帧
+                byte[] req = { slave, 0x03, (byte)(p.StartAddr >> 8), (byte)(p.StartAddr & 0xFF),
+                               (byte)(p.RegCount >> 8), (byte)(p.RegCount & 0xFF) };
+                byte[] frame = Crc(req);
+                var rr = new ReadRequest
+                {
+                    Slave = slave,
+                    StartAddr = p.StartAddr,
+                    RegCount = p.RegCount,
+                    Tag = p.Tag,
+                    Scale = p.Scale,
+                    Unit = p.Unit,
+                    Frame = frame,
+                };
+                // ★ 延迟投递：开到位后等设备数据就绪再读。
+                //   用 ThreadPool 异步等 DelayMs 后入队，不阻塞当前写线程。
+                int delay = p.DelayMs;
+                if (delay <= 0)
+                {
+                    readQueue.Enqueue(rr);
+                    Console.WriteLine($"[采集任务] 从站{slave:X2} {p.Tag}@0x{p.StartAddr:X4} 已投递");
+                }
+                else
+                {
+                    ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        Thread.Sleep(delay);
+                        readQueue.Enqueue(rr);
+                        Console.WriteLine($"[采集任务] 从站{slave:X2} {p.Tag}@0x{p.StartAddr:X4} 延迟{delay}ms后已投递");
+                    });
+                }
+            }
+        }
+
+        // ★ 执行一次读请求（发 0x03 + 等应答 + 重试）。由 SendLoop 在 busLock 内调用。
+        //   与 ExecuteWrite 同构：清状态 → 设活跃 → 发 → 等应答 → 成功返回。
+        static bool ExecuteRead(ReadRequest rr)
+        {
+            byte slave = rr.Slave;
+            byte[] frame = rr.Frame;
+
+            try
+            {
+                for (int attempt = 1; attempt <= WriteRetry; attempt++)
+                {
+                    ClearRxState();
+                    rr.Ack.Reset();
+
+                    activeRead = rr;
+                    curSlave = slave;   // ★ 告诉接收线程：现在在等这个从站
+
+                    bool sendFailed = false;
+                    try
+                    {
+                        if (!SendFrame(frame)) return false;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[读异常·从站{slave:X2}] 第{attempt}次 发送失败：{ex.Message}，继续重试");
+                        sendFailed = true;
+                    }
+
+                    if (!sendFailed)
+                    {
+                        if (Verbose) Console.WriteLine($"[采集→从站{slave:X2}] {rr.Tag}@0x{rr.StartAddr:X4} {Hex(frame)}");
+
+                        if (rr.Ack.WaitOne(TimeoutMs))
+                        {
+                            if (rr.AckOk) return true;
+                            Console.WriteLine($"[读异常·从站{slave:X2}] 从站返回异常响应，继续重试");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[读超时·从站{slave:X2}] 第{attempt}次 {TimeoutMs}ms 没应答，继续重试");
+                            // ★ 同 SendLoop 超时修复：置 curSlave 无效，防止迟到应答误 Set pollAck
+                            curSlave = 0xFF;
+                        }
+                    }
+                    Thread.Sleep(IntervalMs);
+                }
+                Console.WriteLine($"[读失败·从站{slave:X2}] {rr.Tag} 重试{WriteRetry}次仍未成功");
+                return false;
+            }
+            finally
+            {
+                activeRead = null;
+            }
         }
 
         // 开到位：写线圈 ON

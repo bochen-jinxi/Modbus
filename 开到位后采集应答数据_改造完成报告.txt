@@ -1,0 +1,207 @@
+================================================================================
+Program.cs 代码改造完成报告
+"开到位后采集设备应答数据"功能实现
+================================================================================
+改造时间：2026-11-04
+改造对象：F:\chenbo\Program.cs
+编译结果：Build succeeded. 0 Error(s), 19 Warning(s)（警告均为原有，非本次引入）
+================================================================================
+
+
+一、改造目标
+================================================================================
+工控现场按下开关开到位后，自动采集设备的应答数据。
+典型场景：电机启动开关开到位后 → 采集转速、电压、电流。
+
+采用方案 B（写后投递读任务到读队列）：
+  - 新增 ReadRequest 模型与 readQueue
+  - ExecuteWrite 成功后投递读任务
+  - SendLoop 优先消费 readQueue
+  - Handle 按 activeRead 解析工程量
+
+
+二、改造内容明细
+================================================================================
+
+2.1 新增数据结构（在 activeWrite 声明之后）
+--------------------------------------------------------------------------------
+  ① class ReadRequest
+     - Slave/StartAddr/RegCount/Tag/Scale/Unit/Frame
+     - Ack(AutoResetEvent)/AckOk/Values/Completed(ManualResetEventSlim)/Result
+     与 WriteRequest 同构，每个读任务独立等自己的 0x03 应答。
+
+  ② static ConcurrentQueue<ReadRequest> readQueue
+     读请求队列，ExecuteWrite 成功后投递，SendLoop 优先消费。
+
+  ③ static volatile ReadRequest activeRead
+     当前读线程正在等应答的请求，Handle 通过它分发 0x03 应答。
+
+  ④ class ReadProfile
+     设备读配置描述：Tag/StartAddr/RegCount/Scale/Unit/DelayMs
+
+  ⑤ static Dictionary<(byte,ushort), ReadProfile[]> ReadProfiles
+     读配置表，硬编码。当前配置：
+     - 从站0x01 线圈0（电机启动）开到位后，延迟500ms读：
+       转速@0x0100 (Scale=1.0, RPM)
+       电压@0x0101 (Scale=0.1, V)
+       电流@0x0102 (Scale=0.01, A)
+
+
+2.2 改造 SendLoop（发送线程）
+--------------------------------------------------------------------------------
+  在 busLock 事务内，优先消费 readQueue：
+    if (readQueue.TryDequeue(out var rr))
+    {
+        ExecuteRead(rr);
+        Thread.Sleep(IntervalMs);
+        continue;
+    }
+  没有读任务才做原来的周期轮询。
+  事件触发的读比周期轮询优先（开到位后的数据是用户主动要的）。
+
+
+2.3 改造 ExecuteWrite（写请求执行）
+--------------------------------------------------------------------------------
+  在写成功返回前，新增：
+    if (on) EnqueueReadTasks(slave, addr);
+  即：开到位(ON)成功后，投递设备数据采集读任务。
+  关到位(OFF)不触发采集（关了就没数据可采）。
+
+
+2.4 新增 EnqueueReadTasks 方法
+--------------------------------------------------------------------------------
+  - 查 ReadProfiles[(slave, coilAddr)]，没配置则直接返回
+  - 对每个 ReadProfile 构造 0x03 读请求帧
+  - DelayMs > 0 时用 ThreadPool 异步延迟投递（不阻塞写线程）
+  - DelayMs <= 0 时直接投递
+  - 打印投递日志
+
+
+2.5 新增 ExecuteRead 方法
+--------------------------------------------------------------------------------
+  与 ExecuteWrite 同构：
+  - 清接收状态（DiscardInBuffer + buf.Clear）
+  - 设 activeRead = rr, curSlave = slave
+  - 发送 0x03 帧
+  - 等 rr.Ack（TimeoutMs 超时）
+  - 成功返回 true，失败重试 WriteRetry 次
+  - finally 清 activeRead
+
+
+2.6 改造 Handle（帧处理）
+--------------------------------------------------------------------------------
+  ① 多从站校验改造：
+     原：写用 activeWrite.Slave，读用 curSlave
+     新：写用 activeWrite.Slave，事件触发读用 activeRead.Slave，周期轮询读用 curSlave
+
+  ② 异常响应分支改造：
+     原：0x05 异常通知 activeWrite，其他通知 frameReceived
+     新：0x05 异常通知 activeWrite，0x03/0x04 异常通知 activeRead（若有）否则 frameReceived
+
+  ③ 0x03/0x04 正常应答分支改造：
+     原：硬编码按温湿度解析（t=frame[3..4], h=frame[5..6]）
+     新：若 activeRead != null，按 activeRead.Tag/Scale/Unit 输出工程量
+         如：[采集结果·从站01] 转速 = 1450 RPM（原始值=1450）
+         否则按原逻辑（温湿度）解析
+
+
+三、执行时序示例
+================================================================================
+用户输入：on 1 0
+
+t=0     CmdLoop 投递 WriteRequest(从站1, 线圈0, ON) 到 writeQueue
+t=5     WriteLoop 取出，lock(busLock)，发 0x05，等回显
+t=23    收到 0x05 回显，开到位成功
+        ExecuteWrite 调用 EnqueueReadTasks(1, 0)
+        查 ReadProfiles[(1,0)]，构造 3 个 ReadRequest（转速/电压/电流）
+        DelayMs=500，用 ThreadPool 延迟投递
+        释放 busLock，WriteLoop 设置 Completed
+t=523   ThreadPool 延迟到期，3 个 ReadRequest 入 readQueue
+        打印：[采集任务] 从站01 转速@0x0100 延迟500ms后已投递
+t=524   SendLoop 取出 ReadRequest(转速)，lock(busLock)，ExecuteRead
+        发 0x03 @0x0100，等应答
+t=542   收到应答，Handle 按 activeRead 解析
+        打印：[采集结果·从站01] 转速 = 1450 RPM（原始值=1450）
+t=557   SendLoop 取出 ReadRequest(电压)... 打印：电压 = 38.0 V
+t=572   SendLoop 取出 ReadRequest(电流)... 打印：电流 = 1.25 A
+t=587   readQueue 空，SendLoop 恢复正常周期轮询
+
+
+四、锁与线程安全分析
+================================================================================
+  - readQueue 是 ConcurrentQueue，线程安全，多线程并发 Enqueue 不冲突
+  - activeRead 是 volatile，Handle 读、ExecuteRead 写，可见性保证
+  - ExecuteRead 在 busLock 内执行（由 SendLoop 的 TryEnter 保护），与写事务互斥
+  - ExecuteRead 内部锁顺序 io→gate，与 OnData/ExecuteWrite 一致，不死锁
+  - Handle 的 0x03 分支：activeRead != null 时走事件触发读路径，否则走周期轮询路径
+    busLock 保证同一时刻只有一种事务在等应答，不会同时有 activeRead 和周期轮询
+
+
+五、编译警告说明（均为原有，非本次引入）
+================================================================================
+  - CS0162 Unreachable code：原代码 try 块内 `if (!sp.IsOpen) break;` 导致
+    （break 在 try 块内无法跳出 while，编译器判定后续代码不可达）
+  - CS0649 ReadRequest.Result 未赋值：ExecuteRead 返回 bool 而非写 Result 字段
+    （与 ExecuteWrite 一致的设计，Result 保留供未来需要时使用）
+  - NETSDK1138/NU1803：net5.0 过期、HTTP nuget 源，与本次改造无关
+
+
+六、配置说明
+================================================================================
+当前 ReadProfiles 硬编码在 Program.cs 中：
+  ReadProfiles = { (0x01, 0) → [转速@0x0100, 电压@0x0101, 电流@0x0102] }
+
+要适配实际设备，修改 ReadProfiles 即可：
+  - key：(从站号, 线圈地址)——哪个开关开到位后触发
+  - Tag：数据名称（显示用）
+  - StartAddr：Modbus 寄存器起始地址
+  - RegCount：读几个寄存器
+  - Scale：工程量换算系数（显示值 = 原始值 × Scale）
+  - Unit：单位（显示用）
+  - DelayMs：开到位后延迟多少毫秒再读（等设备数据就绪）
+
+示例：阀门开启线圈1 开到位后，延迟1000ms读开度和流量
+  { (0x01, 1), new[]
+      {
+          new ReadProfile { Tag = "开度", StartAddr = 0x0200, RegCount = 1, Scale = 0.1, Unit = "%", DelayMs = 1000 },
+          new ReadProfile { Tag = "流量", StartAddr = 0x0201, RegCount = 1, Scale = 0.01, Unit = "m³/h", DelayMs = 1000 },
+      }
+  }
+
+
+七、使用方式
+================================================================================
+  交互模式：dotnet run
+    输入：on 1 0
+    效果：从站1线圈0开到位 → 延迟500ms → 自动采集并打印转速/电压/电流
+
+  参数模式：dotnet run on 1 0
+    效果：执行一次开到位 → 采集 → 退出
+    注意：参数模式会立即退出，延迟读任务可能来不及执行
+          （ThreadPool 延迟投递时主线程已 return）
+          建议用交互模式测试开到位后采集
+
+
+八、注意事项与已知限制
+================================================================================
+  1. 参数模式（dotnet run on 1 0）下，延迟读任务可能来不及执行：
+     程序在写成功后立即 running=false 并退出，ThreadPool 延迟投递来不及。
+     建议用交互模式测试。
+
+  2. 读任务占用总线期间，周期轮询（温湿度）暂停：
+     3 个读任务约耗时 3×(发送+应答+间隔) ≈ 3×80ms = 240ms，
+     期间温湿度采集有间隙。可接受（事件触发数据更重要）。
+
+  3. 频繁开关会堆积读任务：
+     每次 on 都投递 3 个读任务，频繁 on 会导致 readQueue 堆积。
+     当前未限制队列长度，生产环境可加上限或去重。
+
+  4. ReadProfiles 硬编码：
+     修改配置需重新编译。后续可扩展为 JSON 配置文件。
+
+  5. 关到位(OFF)不触发采集：
+     设计如此（关了就没数据）。如需关到位后也采集，去掉 ExecuteWrite 中的 if(on) 判断。
+
+================================================================================
+                          改造完成报告结束
+================================================================================

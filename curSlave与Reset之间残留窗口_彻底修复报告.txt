@@ -1,0 +1,206 @@
+================================================================================
+curSlave=0xFF 与 Reset 之间残留窗口分析及彻底修复报告
+================================================================================
+分析时间：2026-11-04
+分析对象：F:\chenbo\Program.cs SendLoop 超时分支与 Handle 的竞态
+编译结果：Build succeeded. 0 Error(s)
+================================================================================
+
+
+一、用户问题
+================================================================================
+会不会存在 SendLoop 线程执行了：
+    curSlave = 0xFF;
+    frameReceived.Reset();
+接收线程又发送了 Set，点亮了灯？
+
+
+二、结论：窗口确实存在，已彻底修复
+================================================================================
+用户描述的窗口确实存在。即使先 curSlave=0xFF 再 Reset，两行语句非原子，
+Handle 可能在 curSlave=0xFF 之前读了旧 curSlave（校验通过），在 Reset 之后 Set 灯。
+已用"独立信号 pollAck + 请求序号 curPollSeq"彻底修复。
+
+
+三、窗口存在的根本原因
+================================================================================
+
+3.1 两行非原子语句之间的交错
+--------------------------------------------------------------------------------
+  SendLoop 超时分支：
+    curSlave = 0xFF;        // ①
+    frameReceived.Reset();  // ②
+  ① 和 ② 是两条独立指令，不是原子的。
+
+  Handle 处理应答：
+    expect = curSlave;      // A（读 curSlave）
+    if (frame[0] != expect) return;  // B（校验）
+    frameReceived.Set();    // C（Set 灯）
+  A、B、C 也是非原子的。
+
+3.2 危险的交错时序
+--------------------------------------------------------------------------------
+  t=49.9  Handle: A → expect = curSlave → 读到 1（在 ① 之前读）
+  t=50.0  SendLoop: ① → curSlave = 0xFF
+  t=50.1  SendLoop: ② → frameReceived.Reset()  // 灯灭
+  t=50.2  Handle: B → frame[0](1) == expect(1) → 校验通过
+  t=50.3  Handle: C → frameReceived.Set()        // ★ 灯又亮！在 Reset 之后！
+  t=50.4  SendLoop: 下一轮 WaitOne → 灯亮 → 立即返回 true → 误判成功
+
+  ★ 这就是用户描述的窗口：Handle 在 ① 之前读了旧 curSlave，
+    在 ② 之后 Set 了灯，Reset 关不掉这个 Set（Set 在 Reset 之后）。
+
+3.3 为什么上一轮的"先 curSlave=0xFF 再 Reset"修不好
+--------------------------------------------------------------------------------
+  上一轮修复只改了顺序，但两行语句之间的窗口仍在：
+    ① curSlave=0xFF 之前，Handle 可能已读了旧 curSlave
+    ② Reset 之后，Handle 可能再 Set
+  无论怎么调顺序，只要是用"两个独立变量"（curSlave + frameReceived）协同，
+  就无法原子地"同时失效两者"，总有交错窗口。
+
+
+四、彻底修复方案：独立信号 pollAck + 请求序号 curPollSeq
+================================================================================
+
+4.1 核心思路
+--------------------------------------------------------------------------------
+  放弃用全局 frameReceived 给周期轮询读用，改用独立信号 pollAck。
+  引入单调递增的请求序号 pollSeq，每次发请求前递增，记录当前序号 curPollSeq。
+  Handle 只在 curPollSeq > 0（有活跃请求）时才 Set pollAck。
+  超时后置 curPollSeq = -1（失效），迟到应答到达时 curPollSeq 已是 -1 → 不 Set。
+
+4.2 新增变量
+--------------------------------------------------------------------------------
+  static readonly AutoResetEvent pollAck = new AutoResetEvent(false);
+  static int pollSeq = 0;              // 单调递增请求序号
+  static volatile int curPollSeq = 0;  // 当前正在等应答的序号
+
+4.3 SendLoop 改造
+--------------------------------------------------------------------------------
+  发请求前：
+    int seq = Interlocked.Increment(ref pollSeq);
+    curPollSeq = seq;
+    pollAck.Reset();
+  等应答：
+    if (!pollAck.WaitOne(TimeoutMs))  // 用 pollAck 替代 frameReceived
+    超时后：
+    curPollSeq = -1;    // ★ 失效序号，迟到应答检查 curPollSeq(-1) → 不 Set pollAck
+    curSlave = 0xFF;    // 双保险
+    pollAck.Reset();
+
+4.4 Handle 改造（0x03/0x04 周期轮询应答）
+--------------------------------------------------------------------------------
+  原代码：
+    frameReceived.Set();
+  新代码：
+    int curSeq = curPollSeq;   // 一次性读取
+    if (curSeq > 0)
+        pollAck.Set();
+    else
+        frameReceived.Set();   // 兼容非周期轮询场景
+
+4.5 异常响应分支同理改造
+--------------------------------------------------------------------------------
+  else if (orig == 0x03 || orig == 0x04) {
+      var ar = activeRead;
+      if (ar != null) { ar.AckOk = false; ar.Ack.Set(); }
+      else if (curPollSeq > 0) pollAck.Set();
+      else frameReceived.Set();
+  }
+  else {
+      if (curPollSeq > 0) pollAck.Set();
+      else frameReceived.Set();
+  }
+
+
+五、修复后的时序分析（所有交错都安全）
+================================================================================
+
+5.1 时序 A：Handle 读 curSlave 在前，SendLoop 超时在后
+--------------------------------------------------------------------------------
+  t=49.9  Handle: expect = curSlave → 1（旧值）
+  t=50.0  SendLoop: curPollSeq = -1   // ★ 失效序号
+  t=50.1  SendLoop: curSlave = 0xFF
+  t=50.2  SendLoop: pollAck.Reset()
+  t=50.3  Handle: 校验 frame[0](1)==expect(1) → 通过
+  t=50.4  Handle: curSeq = curPollSeq → -1   // ★ 读到失效序号
+  t=50.5  Handle: curSeq > 0? 否 → 不 Set pollAck → 走 else 分支
+  t=50.6  SendLoop: 下一轮 pollAck.WaitOne → 灯灭 → 正常等
+  ★ 安全：迟到应答因 curPollSeq=-1 不 Set pollAck
+
+5.2 时序 B：SendLoop 超时在前，Handle 读 curSlave 在后
+--------------------------------------------------------------------------------
+  t=50.0  SendLoop: curPollSeq = -1
+  t=50.1  SendLoop: curSlave = 0xFF
+  t=50.2  SendLoop: pollAck.Reset()
+  t=50.3  Handle: expect = curSlave → 0xFF
+  t=50.4  Handle: frame[0](1) != 0xFF → 校验失败 → return → 不 Set
+  ★ 安全：迟到应答因 curSlave=0xFF 校验失败，直接 return
+
+5.3 时序 C：Handle 在 SendLoop 超时过程中 Set
+--------------------------------------------------------------------------------
+  t=49.9  Handle: expect = curSlave → 1（旧值）
+  t=50.0  Handle: 校验通过
+  t=50.1  Handle: curSeq = curPollSeq → 还是正数（超时还没执行）
+  t=50.2  Handle: pollAck.Set()   // 灯亮
+  t=50.3  SendLoop: curPollSeq = -1
+  t=50.4  SendLoop: pollAck.Reset()   // ★ 灯灭（Set 在 Reset 之前）
+  t=50.5  SendLoop: 下一轮 pollAck.WaitOne → 灯灭 → 正常等
+  ★ 安全：Set 在 Reset 之前，Reset 关掉了灯
+
+5.4 时序 D：Handle 的 Set 在 SendLoop 的 Reset 之后
+--------------------------------------------------------------------------------
+  t=49.9  Handle: expect = curSlave → 1（旧值）
+  t=50.0  SendLoop: curPollSeq = -1   // ★ 先失效序号
+  t=50.1  SendLoop: pollAck.Reset()
+  t=50.2  Handle: 校验 frame[0](1)==expect(1) → 通过
+  t=50.3  Handle: curSeq = curPollSeq → -1   // ★ 读到失效序号！
+  t=50.4  Handle: curSeq > 0? 否 → 不 Set pollAck → 走 else
+  ★ 安全：虽然校验通过，但 curPollSeq=-1 → 不 Set pollAck
+  ★ 这正是序号机制的核心作用：即使校验通过（旧 curSlave），序号失效也能阻断 Set
+
+
+六、为什么序号机制能彻底解决
+================================================================================
+
+6.1 序号是"超时状态"的单一标记
+--------------------------------------------------------------------------------
+  原方案用两个变量（curSlave + frameReceived）协同，非原子，有窗口。
+  新方案用 curPollSeq 一个变量标记"是否有活跃请求"：
+    - > 0：有活跃请求，Handle 可以 Set pollAck
+    - -1：无活跃请求（已超时），Handle 不 Set pollAck
+  单变量的读写在 volatile 下是原子的（int 原子读写），无窗口。
+
+6.2 超时后 curPollSeq=-1 是"不可逆"的阻断
+--------------------------------------------------------------------------------
+  超时后 curPollSeq=-1，无论 Handle 何时到达，读 curPollSeq 都是 -1 → 不 Set。
+  直到下一轮发请求前 curPollSeq 才会被设为新的正数序号。
+  所以"超时到下一轮发送"之间，pollAck 不会被任何迟到应答 Set。
+
+6.3 curSlave=0xFF 退化为"双保险"
+--------------------------------------------------------------------------------
+  有了序号机制后，curSlave=0xFF 不再是必需的（序号已能阻断）。
+  保留它是双保险：即使序号机制有未考虑到的边界，curSlave=0xFF 还能拦一道。
+
+
+七、兼容性说明
+================================================================================
+  - frameReceived 保留，用于非周期轮询场景（如参数模式 dotnet run on 1 0）
+  - Handle 中 curPollSeq <= 0 时走 frameReceived.Set()，兼容旧逻辑
+  - WriteRequest/ReadRequest 用各自的 Ack 信号，不受影响
+  - ExecuteRead 用 rr.Ack，不受影响
+
+
+八、总结
+================================================================================
+用户精准地指出了"curSlave=0xFF 和 Reset 之间残留窗口"的问题。
+根本原因是两个独立变量无法原子协同失效，Handle 可能在窗口内 Set。
+
+彻底修复：引入独立信号 pollAck + 请求序号 curPollSeq。
+超时后 curPollSeq=-1（单变量原子失效），迟到应答检查 curPollSeq → -1 → 不 Set。
+所有交错时序均安全（A/B/C/D 四种时序逐一验证）。
+curSlave=0xFF 保留为双保险。编译通过，零错误。
+
+================================================================================
+                          修复报告结束
+================================================================================
