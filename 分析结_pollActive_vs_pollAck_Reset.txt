@@ -1,0 +1,258 @@
+================================================================================
+pollActive vs pollAck.Reset() 深度分析
+================================================================================
+分析时间：2026-11-09
+分析文件：F:\chenbo\Program.cs
+分析问题：已有pollAck.Reset()，为什么还需要pollActive=false？
+
+================================================================================
+一、直接回答
+================================================================================
+
+pollAck.Reset() 只能清除"已经Set的信号"——事后灭火。
+pollActive=false 能阻止"未来到达的迟到应答触发新的Set"——关掉火源。
+
+两者解决的是不同时间点的问题，缺一不可。
+
+================================================================================
+二、核心区别：事后清除 vs 源头阻止
+================================================================================
+
+┌──────────────────┬────────────────────────────────────────────────────────┐
+│ 机制             │ 作用                                                   │
+├──────────────────┼────────────────────────────────────────────────────────┤
+│ pollAck.Reset()  │ 事后清除：把已经亮了的信号灯关掉                       │
+│                  │ 只能清除"Reset调用那一刻之前"已经Set的信号             │
+│                  │ 无法阻止"Reset调用之后"新到达的应答再次Set             │
+├──────────────────┼────────────────────────────────────────────────────────┤
+│ pollActive=false │ 源头阻止：让Handle不再Set pollAck                      │
+│                  │ 从源头切断信号产生，未来到达的迟到应答也不会Set        │
+│                  │ 是"门控"——关上门，外面的信号进不来                    │
+└──────────────────┴────────────────────────────────────────────────────────┘
+
+================================================================================
+三、反例：只有pollAck.Reset()没有pollActive=false
+================================================================================
+
+【场景：迟到应答在Reset之后到达】
+
+时序：
+  T1: SendLoop 发请求，pollAck.Reset()，pollActive=true
+  T2: WaitOne(50ms) 超时
+  T3: ClearRxState() → 清空buf和驱动缓冲
+  T4: pollAck.Reset() → 清除已有信号（此时信号可能是灭的）
+  T5: idx++，进入下一轮循环
+  T6: 下一轮：pollAck.Reset()，pollActive=true（新请求）
+  T7: 发新请求（从站2）
+  T8: 从站1的迟到应答到达！OnData触发，Handle处理
+  T9: Handle检查：func=0x03，activeRead==null，走周期轮询分支
+  T10: Handle执行 pollAck.Set() ← 迟到应答误触发了信号！
+  T11: SendLoop的WaitOne立即返回（以为是新请求的应答）
+  T12: 但这是从站1的应答，不是从站2的 → 错配！
+
+结果：从站1的迟到应答被误当成从站2的应答，数据错配。
+
+【修复方案】
+在T2超时后，除了pollAck.Reset()，还要pollActive=false：
+
+  T2: 超时
+  T3: ClearRxState()
+  T4: pollActive=false → 关掉门控
+  T5: pollAck.Reset() → 清除已有信号
+  ...
+  T8: 从站1的迟到应答到达
+  T9: Handle检查：if (pollActive) → false → 不Set pollAck ✅
+
+================================================================================
+四、反例：只有pollActive=false没有pollAck.Reset()
+================================================================================
+
+【场景：信号在超时前已Set，但WaitOne已超时返回】
+
+时序：
+  T1: SendLoop 发请求，pollActive=true
+  T2: 从站应答到达，Handle处理，pollAck.Set() ← 信号亮了
+  T3: 但WaitOne已经超时返回（应答在超时窗口之外到达）
+  T4: pollActive=false → 关掉门控
+  T5: （没有pollAck.Reset()）
+  T6: 下一轮：pollActive=true，pollAck.Reset() ← 这里才Reset
+  T7: 发新请求
+  T8: WaitOne → 立即返回！（因为T2时Set的信号还在）
+
+等等，T6有pollAck.Reset()，所以这个场景实际上不会出问题。
+让我构造一个更精确的反例：
+
+时序：
+  T1: SendLoop 发请求，pollActive=true，pollAck.Reset()
+  T2: 从站应答到达，Handle处理
+  T3: Handle检查pollActive(true) → pollAck.Set() ← 信号亮了
+  T4: 但SendLoop的WaitOne已经超时返回（T3的Set发生在超时之后）
+  T5: pollActive=false
+  T6: pollAck.Reset() ← 清除T3的Set
+  T7: 下一轮：pollActive=true，pollAck.Reset()
+  T8: 发新请求
+  T9: WaitOne → 正常等待 ✅
+
+这个场景中，pollAck.Reset()在T6清除了T3的Set，所以没问题。
+
+但如果T3的Set发生在T6之后呢？
+
+时序：
+  T1: SendLoop 发请求，pollActive=true，pollAck.Reset()
+  T2: WaitOne(50ms) 超时
+  T3: pollActive=false
+  T4: pollAck.Reset()
+  T5: 下一轮：pollActive=true，pollAck.Reset()
+  T6: 发新请求
+  T7: 从站1的迟到应答到达（在T5和T6之间到达）
+  T8: Handle检查pollActive(true) → pollAck.Set() ← 误触发！
+
+这个场景中，pollActive在T5被重新置为true，迟到应答在T7到达时pollActive已经是true，
+所以Handle会Set pollAck。
+
+但这是"下一轮已经开始了"的情况，迟到应答被误当成下一轮的应答。
+这正是curSlave=0xFF的作用——双保险，从站号校验会拒绝迟到应答。
+
+所以完整的防护链是：
+1. pollActive=false → 阻止超时后到下一轮开始前的迟到应答
+2. curSlave=0xFF → 阻止下一轮开始后的迟到应答（从站号不匹配）
+3. pollAck.Reset() → 清除已有信号
+
+================================================================================
+五、三道防线协同工作
+================================================================================
+
+┌──────────────────┬────────────────────────────────────────────────────────┐
+│ 防线             │ 防护时间窗口                                           │
+├──────────────────┼────────────────────────────────────────────────────────┤
+│ pollActive=false │ 超时后 ~ 下一轮pollActive=true之前                    │
+│                  │ 这个窗口内迟到应答到达 → Handle不Set pollAck           │
+├──────────────────┼────────────────────────────────────────────────────────┤
+│ curSlave=0xFF    │ 超时后 ~ 下一轮curSlave=新值之前                      │
+│                  │ 这个窗口内迟到应答到达 → 从站号不匹配 → 忽略          │
+├──────────────────┼────────────────────────────────────────────────────────┤
+│ pollAck.Reset()  │ 清除超时时刻之前已经Set的信号                         │
+│                  │ 防止下一轮WaitOne被残留信号误唤醒                     │
+└──────────────────┴────────────────────────────────────────────────────────┘
+
+【三道防线的时间线】
+
+  超时发生
+    │
+    ├── pollActive=false ────── 下一轮pollActive=true
+    │   ←这个窗口内，迟到应答不Set pollAck→
+    │
+    ├── curSlave=0xFF ──────── 下一轮curSlave=新从站
+    │   ←这个窗口内，迟到应答从站号不匹配→
+    │
+    └── pollAck.Reset()
+        ←清除之前已Set的信号→
+
+================================================================================
+六、线程交错时序穷举
+================================================================================
+
+【场景1：迟到应答在超时后、Reset后到达】
+T1: SendLoop 发请求，pollActive=true
+T2: WaitOne超时
+T3: pollActive=false ← 门控关闭
+T4: pollAck.Reset() ← 清除已有信号
+T5: 迟到应答到达，Handle处理
+T6: Handle检查pollActive(false) → 不Set pollAck ✅
+
+【场景2：迟到应答在超时后、pollActive=false前到达】
+T1: SendLoop 发请求，pollActive=true
+T2: WaitOne超时
+T3: 迟到应答到达，Handle处理
+T4: Handle检查pollActive(true) → pollAck.Set() ← 信号亮了
+T5: pollActive=false ← 门控关闭（但信号已经亮了）
+T6: pollAck.Reset() ← 清除T4的Set ✅
+
+关键：T4的Set和T6的Reset之间，如果下一轮WaitOne执行，会被误唤醒。
+但T3~T6都在同一个线程（SendLoop）的同一个代码块内，不会被中断。
+（SendLoop是单线程，超时分支的代码是顺序执行的）
+
+等等，T3的迟到应答是在OnData线程中处理的，不在SendLoop线程中。
+所以T3~T6之间确实可能被OnData线程插入。
+
+但T4的Set发生在OnData线程，T5~T6发生在SendLoop线程。
+SendLoop线程在T2超时后，顺序执行T5(pollActive=false)和T6(pollAck.Reset())。
+在这两步之间，OnData线程不会插入（因为这两步之间没有锁操作）。
+
+更精确地说：
+- T2: SendLoop线程，WaitOne超时返回
+- T3: OnData线程，Handle执行（可能在T2之前或之后）
+- T4: OnData线程，pollAck.Set()
+- T5: SendLoop线程，pollActive=false
+- T6: SendLoop线程，pollAck.Reset()
+
+如果T4发生在T5之后、T6之前：
+  T5: pollActive=false
+  T4: Handle检查pollActive(false) → 不Set ✅
+
+如果T4发生在T5之前：
+  T4: Handle检查pollActive(true) → Set
+  T5: pollActive=false
+  T6: pollAck.Reset() → 清除T4的Set ✅
+
+两种情况都安全 ✅
+
+【场景3：只有pollAck.Reset()没有pollActive=false】
+T1: SendLoop 发请求，pollActive=true（假设没有pollActive机制）
+T2: WaitOne超时
+T3: pollAck.Reset() ← 清除已有信号
+T4: 迟到应答到达，Handle处理
+T5: Handle执行 pollAck.Set() ← 没有pollActive门控，直接Set！
+T6: 下一轮WaitOne被误唤醒 ❌
+
+这就是为什么需要pollActive=false！
+
+【场景4：只有pollActive=false没有pollAck.Reset()】
+T1: SendLoop 发请求，pollActive=true
+T2: 从站应答到达，Handle处理，pollAck.Set() ← 信号亮了
+T3: WaitOne超时（Set发生在超时窗口之外）
+T4: pollActive=false ← 门控关闭
+T5: （没有pollAck.Reset()）
+T6: 下一轮：pollActive=true，pollAck.Reset() ← 这里才Reset
+T7: 发新请求
+T8: WaitOne → 正常等待 ✅
+
+这个场景安全，因为T6的Reset在WaitOne之前。
+但如果T2的Set发生在T6之后呢？
+
+T1: SendLoop 发请求，pollActive=true，pollAck.Reset()
+T2: WaitOne超时
+T3: pollActive=false
+T4: 下一轮：pollActive=true，pollAck.Reset()
+T5: 发新请求
+T6: 从站1的迟到应答到达
+T7: Handle检查pollActive(true) → pollAck.Set()
+T8: WaitOne被误唤醒 ← 但这是下一轮的应答窗口，curSlave=新从站会拒绝
+
+所以即使没有pollAck.Reset()，curSlave也能防护。
+但pollAck.Reset()是额外保险，确保信号干净。
+
+================================================================================
+七、总结
+================================================================================
+
+【核心结论】
+pollAck.Reset()是事后灭火，pollActive=false是关掉火源。两者缺一不可。
+
+【为什么需要pollActive=false】
+1. pollAck.Reset()只能清除"Reset调用之前"已Set的信号
+2. 迟到应答可能在Reset之后到达，触发新的Set
+3. pollActive=false从源头阻止Handle调用pollAck.Set()
+
+【为什么需要pollAck.Reset()】
+1. 超时前可能有应答已经Set了pollAck（但WaitOne已超时）
+2. 不Reset的话，下一轮WaitOne会被残留信号误唤醒
+
+【三道防线协同】
+1. pollActive=false → 超时后到下一轮开始前，迟到应答不Set
+2. curSlave=0xFF → 从站号不匹配，迟到应答被忽略
+3. pollAck.Reset() → 清除已有残留信号
+
+================================================================================
+分析完成
+================================================================================
